@@ -34,8 +34,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-BENCH_DIR = Path("/home/line/hackathons/star-hunters-workspace/benchmarks")
-BACKEND_DIR = Path("/home/line/hackathons/star-hunters-workspace/star-hunters-main/backend")
+BENCH_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = BENCH_DIR.parent / "backend"
 CITIES_CSV = BACKEND_DIR / "app" / "models" / "world_capital_cities.csv"
 DB_PATH = BENCH_DIR / "bench_cache.db"
 RESULTS_PATH = BENCH_DIR / "benchmark_results.json"

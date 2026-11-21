@@ -13,15 +13,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { fileURLToPath } from 'node:url';
 
-import { ClientPatchCache, gridCacheKey } from '../star-hunters-main/frontend/src/services/clientPatchCache.ts';
-import { decodeDetectorBinaryBuffer } from '../star-hunters-main/frontend/src/utils/binaryDecoder.ts';
-import { detectAndTrackBodiesAtClick } from '../star-hunters-main/frontend/src/utils/clickTracker.ts';
-import { renderEpochBuffersToRgba } from '../star-hunters-main/frontend/src/utils/pixelEngine.ts';
-import { BACKGROUND_STARS, projectSkySin, unprojectSkySin } from '../star-hunters-main/frontend/src/utils/skyProjection.ts';
-import { computeGridKey, computeViewportViewBox } from '../star-hunters-main/frontend/src/utils/wcsViewport.ts';
+import { ClientPatchCache, gridCacheKey } from '../frontend/src/services/clientPatchCache.ts';
+import { decodeDetectorBinaryBuffer } from '../frontend/src/utils/binaryDecoder.ts';
+import { detectAndTrackBodiesAtClick } from '../frontend/src/utils/clickTracker.ts';
+import { renderEpochBuffersToRgba } from '../frontend/src/utils/pixelEngine.ts';
+import { BACKGROUND_STARS, projectSkySin, unprojectSkySin } from '../frontend/src/utils/skyProjection.ts';
+import { computeGridKey, computeViewportViewBox } from '../frontend/src/utils/wcsViewport.ts';
 
-const BENCH_DIR = '/home/line/hackathons/star-hunters-workspace/benchmarks';
+const BENCH_DIR = path.dirname(fileURLToPath(import.meta.url));
 const RESULTS_PATH = path.join(BENCH_DIR, 'benchmark_results.json');
 const REPORT_PATH = path.join(BENCH_DIR, 'benchmark_report.md');
 

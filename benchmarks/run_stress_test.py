@@ -32,9 +32,9 @@ from typing import Any
 
 import numpy as np
 
-BENCH_DIR = Path("/home/line/hackathons/star-hunters-workspace/benchmarks")
+BENCH_DIR = Path(__file__).resolve().parent
 DATASET_DIR = BENCH_DIR / "stress_dataset"
-BACKEND_DIR = Path("/home/line/hackathons/star-hunters-workspace/star-hunters-main/backend")
+BACKEND_DIR = BENCH_DIR.parent / "backend"
 DB_PATH = BENCH_DIR / "stress_cache.db"
 RESULTS_PATH = BENCH_DIR / "stress_test_results.json"
 REPORT_PATH = BENCH_DIR / "stress_test_report.md"

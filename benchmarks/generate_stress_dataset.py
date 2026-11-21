@@ -26,8 +26,8 @@ from typing import Any
 
 import numpy as np
 
-BENCH_DIR = Path("/home/line/hackathons/star-hunters-workspace/benchmarks")
-BACKEND_DIR = Path("/home/line/hackathons/star-hunters-workspace/star-hunters-main/backend")
+BENCH_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = BENCH_DIR.parent / "backend"
 DEFAULT_OUT_DIR = BENCH_DIR / "stress_dataset"
 DEFAULT_MB_PER_PATCH = 1.23
 CITIES_CSV = BACKEND_DIR / "app" / "models" / "world_capital_cities.csv"
