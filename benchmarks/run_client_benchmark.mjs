@@ -6,8 +6,8 @@
  * - Tests multiple ClientPatchCache capacities (64, 128, 192 entries).
  * - Exercises decodeDetectorBinaryBuffer (float16), renderEpochBuffersToRgba (256x256),
  *   detectAndTrackBodiesAtClick, and projectSkySin / unprojectSkySin.
- * - Generates benchmarks/benchmark_report.md with side-by-side backend configuration comparisons
- *   and a multi-configuration Fly.io $5/month ceiling sustainability matrix.
+ * - Generates benchmarks/results/benchmark_report.md with side-by-side backend configuration
+ *   comparisons and a multi-configuration Fly.io $5/month ceiling sustainability matrix.
  */
 
 import fs from 'node:fs';
@@ -23,8 +23,9 @@ import { BACKGROUND_STARS, projectSkySin, unprojectSkySin } from '../frontend/sr
 import { computeGridKey, computeViewportViewBox } from '../frontend/src/utils/wcsViewport.ts';
 
 const BENCH_DIR = path.dirname(fileURLToPath(import.meta.url));
-const RESULTS_PATH = path.join(BENCH_DIR, 'benchmark_results.json');
-const REPORT_PATH = path.join(BENCH_DIR, 'benchmark_report.md');
+const RESULTS_DIR = path.join(BENCH_DIR, 'results');
+const RESULTS_PATH = path.join(RESULTS_DIR, 'benchmark_results.json');
+const REPORT_PATH = path.join(RESULTS_DIR, 'benchmark_report.md');
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -310,30 +311,25 @@ const FLY_CANDIDATE_CONFIGS = [
 ];
 
 export function computeFlyFiveDollarMatrix(wireMbPerSession) {
-  // 20 connections/minute = 1,200 connections/hour
   const sessionsPerHour = 1200;
   const fullEgressGbPerHour = (wireMbPerSession * sessionsPerHour) / 1024.0;
-  const egressRateUsdPerGb = 0.02; // Fly.io North America/Europe outbound transfer ($0.02/GB)
+  const egressRateUsdPerGb = 0.02;
 
   return FLY_CANDIDATE_CONFIGS.map((cfg) => {
     const volUsdMo = round2(cfg.vol_gb * 0.15);
     const availBudgetUsd = Math.max(0, 5.0 - volUsdMo);
 
-    // 1. Warm Demo / Idle-Active Uptime (low external egress)
     const demoMaxHrsMo = round2(availBudgetUsd / cfg.compute_usd_hr);
     const demoHrsPerDay = round2(demoMaxHrsMo / 30.0);
 
-    // 2. Continuous 20 conn/min Peak (0% browser cache reuse across sessions)
     const hrCost0Pct = cfg.compute_usd_hr + fullEgressGbPerHour * egressRateUsdPerGb;
     const peakHrs0Pct = round2(availBudgetUsd / hrCost0Pct);
     const peakSessions0Pct = Math.floor(peakHrs0Pct * sessionsPerHour);
 
-    // 3. Continuous 20 conn/min Peak (50% repeat-visitor browser ClientPatchCache reuse)
     const hrCost50Pct = cfg.compute_usd_hr + fullEgressGbPerHour * 0.5 * egressRateUsdPerGb;
     const peakHrs50Pct = round2(availBudgetUsd / hrCost50Pct);
     const peakSessions50Pct = Math.floor(peakHrs50Pct * sessionsPerHour);
 
-    // 4. Continuous 20 conn/min Peak (80% browser ClientPatchCache reuse)
     const hrCost80Pct = cfg.compute_usd_hr + fullEgressGbPerHour * 0.2 * egressRateUsdPerGb;
     const peakHrs80Pct = round2(availBudgetUsd / hrCost80Pct);
     const peakSessions80Pct = Math.floor(peakHrs80Pct * sessionsPerHour);
@@ -357,7 +353,7 @@ function summarizeTopLevelTiers(tierOutcomes) {
   let sqlite = 0;
   let miss = 0;
   for (const [k, v] of Object.entries(tierOutcomes)) {
-    if (k === 'frame_raw:sqlite_disk') continue; // inner read on frame_gzip RAM miss
+    if (k === 'frame_raw:sqlite_disk') continue;
     if (k.endsWith(':in_memory_lru')) ram += v;
     else if (k.endsWith(':sqlite_disk')) sqlite += v;
     else if (k.endsWith(':miss')) miss += v;
@@ -378,9 +374,9 @@ function buildReportMarkdown(data) {
     {
       config: {
         name: 'default',
-        fly_equivalent: 'shared-cpu-4x',
-        vcpus: 4,
-        coadd_workers: 4,
+        fly_equivalent: 'shared-cpu',
+        vcpus: data.backend_run_1?.server_cpu?.pinned_vcpus ?? '-',
+        coadd_workers: data.backend_run_1?.server_cpu?.coadd_workers ?? '-',
         in_memory_cache_mb: data.backend_run_1?.application_caches?.mem_lru_max_mb ?? 512,
         sqlite_max_cache_mb: data.backend_run_1?.disk_and_sqlite?.sqlite_max_mb ?? 750,
       },
@@ -409,8 +405,8 @@ function buildReportMarkdown(data) {
       ['Run 2 (Prewarmed)', entry.backend_run_2],
     ]) {
       const tiers = summarizeTopLevelTiers(run.application_caches.tier_outcomes_delta);
-      const cpuAvg = run.server_cpu.avg_pct_allocated_vcpus ?? run.server_cpu.avg_pct_4vcpu_norm;
-      const cpuPeak = run.server_cpu.peak_pct_allocated_vcpus ?? run.server_cpu.peak_pct_4vcpu_norm;
+      const cpuAvg = run.server_cpu.avg_pct_allocated_vcpus ?? '-';
+      const cpuPeak = run.server_cpu.peak_pct_allocated_vcpus ?? '-';
       const allLat = run.overall_latency_ms ?? { mean_ms: 0, weighted_p50_ms: 0, weighted_p95_ms: 0 };
       const hvyLat = run.heavy_endpoints_latency_ms ?? { mean_ms: 0, weighted_p50_ms: 0, weighted_p95_ms: 0 };
       const cw = c.coadd_workers ?? run.server_cpu?.coadd_workers ?? '-';
@@ -445,7 +441,7 @@ function buildReportMarkdown(data) {
   if (clientMatrix.length > 0) {
     lines.push(
       '',
-      '## 3. Client-Side Engine & `ClientPatchCache` Capacity Sweep (Node 24)',
+      `## 3. Client-Side Engine & \`ClientPatchCache\` Capacity Sweep (Node ${process.version})`,
       '',
       '| `ClientPatchCache` Capacity | Run 1 Hit Rate | Run 2 Hit Rate | V8 Heap / ArrayBuffers (MB) | `decodeFloat16` p50/p95 (ms) | `renderRgba` p50/p95 (ms) | `projectSkySin` p50/p95 (ms) | `clickToTrack` p50/p95 (ms) |',
       '| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
@@ -503,6 +499,7 @@ async function main() {
     return;
   }
 
+  fs.mkdirSync(RESULTS_DIR, { recursive: true });
   const existing = fs.existsSync(RESULTS_PATH)
     ? JSON.parse(fs.readFileSync(RESULTS_PATH, 'utf-8'))
     : {};
