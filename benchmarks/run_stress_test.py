@@ -109,6 +109,7 @@ def run_stress_server(
     from app.services import catalog_clients as cc_mod
     from app.services import celestial_catalog_pipeline as ccp_mod
     from app.services import object_epochs as oe_mod
+    from app.services import spherex_ingest as si_mod
     from app.services.backend_service import StarHuntersBackendService
     from app.services.spatial_cache import SpatialSqliteCache, compute_grid_key
     from app.services.spectrum_extractor import extract_forced_spectrum
@@ -244,6 +245,7 @@ def run_stress_server(
     ccp_mod.fetch_gaia_dr3_objects = dataset_gaia_fetch  # type: ignore[assignment]
     bs_mod.fetch_most_spherex_matches = dataset_most  # type: ignore[assignment]
     oe_mod.query_observations = dataset_obs_query  # type: ignore[assignment]
+    si_mod.query_observations = dataset_obs_query  # type: ignore[assignment]
 
     service = StarHuntersBackendService(
         cache=cache,

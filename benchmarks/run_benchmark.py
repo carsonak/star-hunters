@@ -249,6 +249,7 @@ def run_bench_server(
     from app.services import catalog_clients as cc_mod
     from app.services import celestial_catalog_pipeline as ccp_mod
     from app.services import object_epochs as oe_mod
+    from app.services import spherex_ingest as si_mod
     from app.services.backend_service import StarHuntersBackendService
     from app.services.spatial_cache import SpatialSqliteCache
     from app.services.spectrum_extractor import extract_forced_spectrum
@@ -312,6 +313,7 @@ def run_bench_server(
     ccp_mod.fetch_gaia_dr3_objects = no_live_fetch  # type: ignore[assignment]
     bs_mod.fetch_most_spherex_matches = no_live_most  # type: ignore[assignment]
     oe_mod.query_observations = lambda *_a, **_kw: []  # type: ignore[assignment]
+    si_mod.query_observations = lambda *_a, **_kw: []  # type: ignore[assignment]
 
     service = StarHuntersBackendService(
         cache=cache,
