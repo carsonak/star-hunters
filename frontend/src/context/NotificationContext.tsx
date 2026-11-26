@@ -12,12 +12,18 @@ import { observatoryLogger } from '../utils/observatoryLogger';
 export type WarningLevel = 'warning' | 'error';
 export type AsyncToastStatus = 'progress' | 'success';
 
+export interface WarningAlertAction {
+  label: string;
+  onClick: () => void;
+}
+
 export interface WarningAlert {
   id: string;
   title: string;
   detail?: string;
   level: WarningLevel;
   createdAt: number;
+  actions?: ReadonlyArray<WarningAlertAction>;
 }
 
 export interface AsyncTaskToast {
@@ -34,6 +40,7 @@ export interface NotificationContextValue {
     title: string;
     detail?: string;
     level?: WarningLevel;
+    actions?: ReadonlyArray<WarningAlertAction>;
   }) => void;
   dismissWarning: (id: string) => void;
   clearWarnings: () => void;
@@ -86,7 +93,13 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({ 
   }, []);
 
   const pushWarning = useCallback(
-    (input: { id?: string; title: string; detail?: string; level?: WarningLevel }) => {
+    (input: {
+      id?: string;
+      title: string;
+      detail?: string;
+      level?: WarningLevel;
+      actions?: ReadonlyArray<WarningAlertAction>;
+    }) => {
       const id = input.id ?? `warn-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       const existingTimer = warningTimersRef.current.get(id);
       if (existingTimer !== undefined) {
@@ -99,6 +112,7 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({ 
         detail: input.detail,
         level: input.level ?? 'warning',
         createdAt: Date.now(),
+        actions: input.actions,
       };
 
       setAlerts((prev) => [nextAlert, ...prev.filter((item) => item.id !== id)]);

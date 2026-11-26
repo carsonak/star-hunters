@@ -175,10 +175,48 @@ export function pixelToSkyWcs(x: number, y: number, wcs: WcsHeader): { ra: numbe
  */
 export function computeDetectorWeights(wavelengthRangeUm: [number, number]): number[] {
   const [minUm, maxUm] = wavelengthRangeUm;
-  return DETECTOR_WAVELENGTH_BOUNDS_UM.map(([dMin, dMax]) => {
+  // When in the optical/near-IR SkyView range (< 0.75 µm), keep Detectors 1–2
+  // (where SkyView plates are packed) proportional to the [0.65, 0.85] µm overlap.
+  const svRatio =
+    minUm < 0.75 ? Math.max(0, Math.min(maxUm, 0.85) - Math.max(minUm, 0.65)) / 0.2 : 0;
+  return DETECTOR_WAVELENGTH_BOUNDS_UM.map(([dMin, dMax], idx) => {
     const overlap = Math.max(0, Math.min(maxUm, dMax) - Math.max(minUm, dMin));
     const width = dMax - dMin;
     const ratio = width > 0 ? overlap / width : 0;
-    return 0.05 + 0.95 * ratio;
+    const effectiveRatio = idx <= 1 && minUm < 0.75 ? Math.min(1, Math.max(ratio, svRatio)) : ratio;
+    return 0.05 + 0.95 * effectiveRatio;
   });
+}
+
+/**
+ * Step a sky-patch center to an adjacent quantized `0.05°` tile in North-Up / East-Left
+ * ICRS coordinates.
+ *
+ * @param ra - Current Right Ascension in degrees.
+ * @param dec - Current Declination in degrees.
+ * @param direction - Cardinal direction to step (`'north' | 'south' | 'east' | 'west'`).
+ * @param stepDeg - Grid step in degrees (defaults to `0.05`).
+ * @returns Quantized `{ raQ, decQ }` center for the adjacent patch.
+ */
+export function stepAdjacentPatchCoordinates(
+  ra: number,
+  dec: number,
+  direction: 'north' | 'south' | 'east' | 'west',
+  stepDeg = 0.05,
+): { raQ: number; decQ: number } {
+  let nextRa = wrapRaDeg(ra);
+  let nextDec = Math.max(-90, Math.min(90, dec));
+  const cosDec = Math.max(0.05, Math.cos((nextDec * Math.PI) / 180));
+
+  if (direction === 'north') {
+    nextDec = Math.min(90, nextDec + stepDeg);
+  } else if (direction === 'south') {
+    nextDec = Math.max(-90, nextDec - stepDeg);
+  } else if (direction === 'east') {
+    nextRa = wrapRaDeg(nextRa + stepDeg / cosDec);
+  } else if (direction === 'west') {
+    nextRa = wrapRaDeg(nextRa - stepDeg / cosDec);
+  }
+
+  return quantizeGridCenter(nextRa, nextDec, stepDeg);
 }

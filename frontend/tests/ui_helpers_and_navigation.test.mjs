@@ -33,6 +33,9 @@ import {
   extractAvailableMissions,
   formatMagnitude,
   formatProperMotion,
+  isWavelengthPresetEnabled,
+  reconcileWavelengthRange,
+  resolveWavelengthConfigForMissions,
   fuzzyScoreText,
   fuzzySearchKnownObjects,
   getDefaultCheckedObjectIds,
@@ -169,6 +172,72 @@ test('ISS-16: wavelength quick-filter pills cover the four required ranges and h
     assert.ok(preset.range[0] >= 0.75 && preset.range[1] <= 5.0);
   }
   assert.equal(isWavelengthPresetActive([1.0, 4.0], [0.75, 5.0]), false);
+});
+
+test('SkyView, WISE, and SPHEREx clamp knobs on the full 0.65–5.0 µm rail and disable out-of-range pills', () => {
+  const skyViewOnly = resolveWavelengthConfigForMissions(
+    [{ mission: 'SkyView', count: 2 }],
+    ['SPHEREx', 'WISE', 'SkyView'],
+    'SkyView',
+  );
+  assert.equal(skyViewOnly.isMissionRestricted, true);
+  assert.equal(skyViewOnly.railMin, 0.65);
+  assert.equal(skyViewOnly.railMax, 5.0);
+  assert.equal(skyViewOnly.min, 0.65);
+  assert.equal(skyViewOnly.max, 0.85);
+  assert.deepEqual(skyViewOnly.defaultRange, [0.65, 0.85]);
+  assert.equal(
+    skyViewOnly.presets.some((p) => isWavelengthPresetEnabled(p.range, skyViewOnly)),
+    false,
+    'All 4 SPHEREx presets are disabled for SkyView (0.65–0.85 µm)',
+  );
+
+  // WISE-only clamps knobs to [2.4, 5.0] and enables Cold + Ice pills only
+  const wiseOnly = resolveWavelengthConfigForMissions(
+    [{ mission: 'WISE', count: 2 }],
+    ['SPHEREx', 'WISE'],
+    'WISE',
+  );
+  assert.equal(wiseOnly.isMissionRestricted, true);
+  assert.equal(wiseOnly.railMin, 0.65);
+  assert.equal(wiseOnly.railMax, 5.0);
+  assert.equal(wiseOnly.min, 2.4);
+  assert.equal(wiseOnly.max, 5.0);
+  assert.deepEqual(wiseOnly.defaultRange, [2.4, 5.0]);
+  assert.deepEqual(
+    wiseOnly.presets.filter((p) => isWavelengthPresetEnabled(p.range, wiseOnly)).map((p) => p.id),
+    ['cold', 'molecules'],
+  );
+
+  // Fallback to primaryMission when availableMissions is empty
+  const skyViewPrimaryFallback = resolveWavelengthConfigForMissions([], ['SkyView'], 'SkyView');
+  assert.equal(skyViewPrimaryFallback.isMissionRestricted, true);
+  assert.deepEqual(skyViewPrimaryFallback.defaultRange, [0.65, 0.85]);
+
+  // SPHEREx or mixed missions retain 0.75–5.0 µm knob bounds on the 0.65–5.0 µm rail
+  const spherexConfig = resolveWavelengthConfigForMissions(
+    [
+      { mission: 'SPHEREx', count: 3 },
+      { mission: 'SkyView', count: 2 },
+    ],
+    ['SPHEREx', 'SkyView'],
+    'SPHEREx',
+  );
+  assert.equal(spherexConfig.isMissionRestricted, false);
+  assert.equal(spherexConfig.railMin, 0.65);
+  assert.equal(spherexConfig.railMax, 5.0);
+  assert.equal(spherexConfig.min, 0.75);
+  assert.equal(spherexConfig.max, 5.0);
+  assert.equal(
+    spherexConfig.presets.every((p) => isWavelengthPresetEnabled(p.range, spherexConfig)),
+    true,
+  );
+
+  // Reconciling wavelength range across mission transitions resets cleanly
+  assert.deepEqual(reconcileWavelengthRange([0.75, 5.0], skyViewOnly), [0.65, 0.85]);
+  assert.deepEqual(reconcileWavelengthRange([0.65, 0.85], spherexConfig, skyViewOnly), [0.75, 5.0]);
+  assert.deepEqual(reconcileWavelengthRange([0.75, 5.0], wiseOnly, spherexConfig), [2.4, 5.0]);
+  assert.deepEqual(reconcileWavelengthRange([3.8, 5.0], spherexConfig), [3.8, 5.0]);
 });
 
 test('ISS-16: known-object rows show a catalog badge, magnitude and proper motion for every preset object', () => {

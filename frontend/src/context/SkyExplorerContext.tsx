@@ -10,6 +10,7 @@ import React, {
 import { useBlinkerPlayback } from '../hooks/useBlinkerPlayback';
 import { useObservatoryWarmup } from '../hooks/useObservatoryWarmup';
 import { usePatchLoader } from '../hooks/usePatchLoader';
+import { useRecentPatches } from '../hooks/useRecentPatches';
 import { useSpectrumInspector } from '../hooks/useSpectrumInspector';
 import { useTargetTracking } from '../hooks/useTargetTracking';
 import type {
@@ -26,12 +27,15 @@ import {
   getDefaultCheckedObjectIds,
   pickClosestEpochIndex,
   pickNearestAllowedEpoch,
+  reconcileWavelengthRange,
   resolveFilteredEpochIndices,
+  resolveWavelengthConfigForMissions,
   selectAllObjectIds,
   toggleObjectId,
 } from '../utils/knownObjectSelection';
 import { observatoryLogger } from '../utils/observatoryLogger';
-import { clampViewportPanZoom } from '../utils/wcsViewport';
+import { formatRaDecCompact } from '../utils/observatoryMath';
+import { clampViewportPanZoom, stepAdjacentPatchCoordinates } from '../utils/wcsViewport';
 import { useOptionalNotifications } from './NotificationContext';
 
 const INITIAL_RENDER_SETTINGS: ViewportRenderSettings = {
@@ -113,6 +117,12 @@ export const SkyExplorerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   const [activeMissions, setActiveMissions] = useState<MissionName[]>(ALL_MISSIONS);
   const [globalKnownObjects, setGlobalKnownObjects] = useState<GlobalKnownObjectEntry[]>([]);
   const [isBlinkerModalOpen, setIsBlinkerModalOpen] = useState<boolean>(false);
+  const isBlinkerModalOpenRef = useRef<boolean>(false);
+  useEffect(() => {
+    isBlinkerModalOpenRef.current = isBlinkerModalOpen;
+  }, [isBlinkerModalOpen]);
+  const { recentPatches, recordRecentPatch, clearRecentPatches } = useRecentPatches();
+  const activePresetSlugRef = useRef<string | null>('wise_0855');
 
   const pendingFocusObjectIdRef = useRef<string | null>(null);
   const preferredEpochMjdRef = useRef<number | null>(null);
@@ -137,9 +147,15 @@ export const SkyExplorerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     loadingState,
     knownObjects,
     objectHighlighterColors,
+    fetchQualityMode,
+    setFetchQualityMode,
+    activePatchDtype,
+    isNetworkSlow,
+    measuredBandwidthMbps,
     loadPresetBundle,
     loadLiveCoordinates,
     retryActivePatch,
+    refetchActivePatch,
   } = usePatchLoader({
     notificationsRef,
     onResetPatchDependents: () => {
@@ -160,20 +176,47 @@ export const SkyExplorerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         preferredMjd !== null && result.manifest.epochs.length > 0
           ? pickClosestEpochIndex(result.manifest.epochs, preferredMjd)
           : 0;
+      const patchMissions = extractAvailableMissions(result.manifest.epochs ?? []);
+      const wlConfig = resolveWavelengthConfigForMissions(
+        patchMissions,
+        ALL_MISSIONS,
+        result.manifest.data_source_summary?.primary_mission,
+      );
       setRenderSettings((prev) => ({
         ...prev,
         activeEpochIndex: targetIdx,
         passAIndex: 0,
         passBIndex: targetIdx > 0 ? targetIdx : Math.max(0, result.manifest.epochs.length - 1),
         coaddIndices: result.manifest.epochs.map((_, idx) => idx),
+        wavelengthRangeUm: reconcileWavelengthRange(prev.wavelengthRangeUm, wlConfig),
         zoom: 1.0,
         panX: 0.0,
         panY: 0.0,
         checkedObjectIds: defaultCheckedIds,
       }));
       patchResetBridgeRef.current.clearTracking();
+      if (isBlinkerModalOpenRef.current) {
+        const slug = activePresetSlugRef.current;
+        const m = result.manifest;
+        recordRecentPatch({
+          id: slug ? `preset:${slug}` : m.query.grid_key,
+          kind: slug ? 'preset' : 'live',
+          slug: slug ?? null,
+          ra: m.query.ra,
+          dec: m.query.dec,
+          fovArcmin: m.query.fov_arcmin,
+          title: m.target_metadata.name,
+          coordsLabel: formatRaDecCompact(m.query.ra, m.query.dec),
+          mission: m.data_source_summary?.primary_mission,
+          openedAt: Date.now(),
+        });
+      }
     },
   });
+
+  useEffect(() => {
+    activePresetSlugRef.current = activePresetSlug;
+  }, [activePresetSlug]);
 
   const {
     selectedObject,
@@ -266,7 +309,8 @@ export const SkyExplorerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         : [...activeMissions, mission];
 
       if (manifest && manifest.epochs.length > 0) {
-        const presentMissions = extractAvailableMissions(manifest.epochs).map((m) => m.mission);
+        const patchMissions = extractAvailableMissions(manifest.epochs);
+        const presentMissions = patchMissions.map((m) => m.mission);
         const remainingPresent = presentMissions.filter((m) => next.includes(m));
         if (remainingPresent.length === 0) {
           notificationsRef.current?.pushWarning({
@@ -277,6 +321,16 @@ export const SkyExplorerProvider: React.FC<{ children: React.ReactNode }> = ({ c
           return;
         }
         const allowed = resolveFilteredEpochIndices(manifest.epochs, next);
+        const prevWlConfig = resolveWavelengthConfigForMissions(
+          patchMissions,
+          activeMissions,
+          manifest.data_source_summary?.primary_mission,
+        );
+        const nextWlConfig = resolveWavelengthConfigForMissions(
+          patchMissions,
+          next,
+          manifest.data_source_summary?.primary_mission,
+        );
         setActiveMissions(next);
         setRenderSettings((prev) => ({
           ...prev,
@@ -284,6 +338,11 @@ export const SkyExplorerProvider: React.FC<{ children: React.ReactNode }> = ({ c
           passAIndex: allowed[0] ?? 0,
           passBIndex: allowed[allowed.length - 1] ?? 0,
           coaddIndices: allowed,
+          wavelengthRangeUm: reconcileWavelengthRange(
+            prev.wavelengthRangeUm,
+            nextWlConfig,
+            prevWlConfig,
+          ),
         }));
         observatoryLogger.info('blinker', 'Mission source filter updated', {
           mission,
@@ -413,14 +472,47 @@ export const SkyExplorerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   const openBlinkerModal = useCallback(
     (target?: string | { ra: number; dec: number; fovArcmin?: number }) => {
       setIsSpectraModalOpen(false);
+      isBlinkerModalOpenRef.current = true;
       if (typeof target === 'string') {
         selectPreset(target);
       } else if (target && typeof target === 'object') {
         navigateToCoordinates(target.ra, target.dec, target.fovArcmin ?? 5.0);
+      } else if (manifest) {
+        recordRecentPatch({
+          id: activePresetSlug ? `preset:${activePresetSlug}` : manifest.query.grid_key,
+          kind: activePresetSlug ? 'preset' : 'live',
+          slug: activePresetSlug ?? null,
+          ra: manifest.query.ra,
+          dec: manifest.query.dec,
+          fovArcmin: manifest.query.fov_arcmin,
+          title: manifest.target_metadata.name,
+          coordsLabel: formatRaDecCompact(manifest.query.ra, manifest.query.dec),
+          mission: manifest.data_source_summary?.primary_mission,
+          openedAt: Date.now(),
+        });
       }
       setIsBlinkerModalOpen(true);
     },
-    [navigateToCoordinates, selectPreset, setIsSpectraModalOpen],
+    [
+      activePresetSlug,
+      manifest,
+      navigateToCoordinates,
+      recordRecentPatch,
+      selectPreset,
+      setIsSpectraModalOpen,
+    ],
+  );
+
+  const stepAdjacentPatch = useCallback(
+    (direction: 'north' | 'south' | 'east' | 'west') => {
+      const baseRa = manifest?.query.ra ?? coordinates.ra;
+      const baseDec = manifest?.query.dec ?? coordinates.dec;
+      const fovArcmin = manifest?.query.fov_arcmin ?? coordinates.fovArcmin;
+      const { raQ, decQ } = stepAdjacentPatchCoordinates(baseRa, baseDec, direction);
+      // Intentionally keep the background 3D globe camera anchored while stepping in Blinker
+      navigateToCoordinates(raQ, decQ, fovArcmin);
+    },
+    [coordinates.dec, coordinates.fovArcmin, coordinates.ra, manifest, navigateToCoordinates],
   );
 
   const closeBlinkerModal = useCallback(() => {
@@ -538,6 +630,15 @@ export const SkyExplorerProvider: React.FC<{ children: React.ReactNode }> = ({ c
       closeSpectraModal,
       untrackObjectById,
       requestGlobeFocus,
+      fetchQualityMode,
+      setFetchQualityMode,
+      activePatchDtype,
+      isNetworkSlow,
+      measuredBandwidthMbps,
+      refetchActivePatch,
+      stepAdjacentPatch,
+      recentPatches,
+      clearRecentPatches,
     }),
     [
       activePresetSlug,
@@ -582,6 +683,15 @@ export const SkyExplorerProvider: React.FC<{ children: React.ReactNode }> = ({ c
       closeSpectraModal,
       untrackObjectById,
       requestGlobeFocus,
+      fetchQualityMode,
+      setFetchQualityMode,
+      activePatchDtype,
+      isNetworkSlow,
+      measuredBandwidthMbps,
+      refetchActivePatch,
+      stepAdjacentPatch,
+      recentPatches,
+      clearRecentPatches,
     ],
   );
 

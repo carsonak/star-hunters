@@ -78,6 +78,7 @@
 .blinker-section-sub-marquee {
   width: 100%;
   max-width: 100%;
+  container-type: inline-size;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -92,9 +93,8 @@
 
 .blinker-section-sub-marquee:hover,
 .blinker-section-sub-marquee:focus-within {
-  overflow-x: auto;
+  overflow: hidden;
   text-overflow: clip;
-  scrollbar-width: none;
 }
 
 .blinker-section-sub-marquee:hover .blinker-section-sub,
@@ -109,7 +109,7 @@
   }
   82%,
   100% {
-    transform: translateX(min(0px, calc(100% - 100vw)));
+    transform: translateX(min(0px, calc(100cqi - 100%)));
   }
 }
 
@@ -142,8 +142,7 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: rgba(11, 15, 23, 0.94);
-  border-right: 1px solid var(--border-hairline);
+  background: rgba(11, 15, 23, 0.96);
   z-index: 4;
   overflow: hidden;
 }
@@ -151,12 +150,17 @@
 .blinker-section-pane {
   display: flex;
   flex-direction: column;
-  min-height: 36px;
+  min-height: 28px;
   overflow: hidden;
 }
 
 .blinker-section-pane.is-folded {
   flex: 0 0 auto;
+}
+
+.blinker-section-pane.is-recents-expanded {
+  flex: 0 0 auto;
+  max-height: 185px;
 }
 
 .blinker-section-pane.is-expanded {
@@ -166,24 +170,35 @@
 .blinker-section-header {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   width: 100%;
-  height: 34px;
+  height: 26px;
   flex-shrink: 0;
-  padding: 0 11px;
-  background: rgba(15, 23, 42, 0.72);
-  border-bottom: 1px solid var(--border-hairline);
+  padding: 0 10px;
+  background: transparent;
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
   color: var(--text-primary);
-  font-size: 11.5px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
   text-align: left;
   cursor: pointer;
 }
 
+.blinker-sidebar > .blinker-section-pane:first-child > .blinker-section-header {
+  border-top: none;
+}
+
 .blinker-section-header:hover {
-  background: rgba(30, 41, 59, 0.82);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.blinker-section-header:focus-visible {
+  outline: 1px solid #007fd4;
+  outline-offset: -1px;
 }
 
 .blinker-section-body {
@@ -214,38 +229,189 @@
   font-size: 10px;
 }
 
+.blinker-preset-btn:disabled {
+  opacity: 0.36;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
 .blinker-mode-stack {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
+.blinker-section-body--recents {
+  gap: 6px;
+  padding: 6px 10px 8px;
+}
+
+.blinker-recents-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 118px;
+  overflow-y: auto;
+}
+
+.blinker-recent-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  width: 100%;
+  padding: 5px 8px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(15, 23, 42, 0.45);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.blinker-recent-row:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.blinker-recent-row.is-active {
+  border-color: rgba(0, 127, 212, 0.7);
+  background: rgba(0, 127, 212, 0.16);
+}
+
+.blinker-recent-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.blinker-recent-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
 .blinker-split-resizer {
-  height: 5px;
+  position: relative;
+  height: 1px;
   flex-shrink: 0;
-  background: rgba(148, 163, 184, 0.14);
-  border-top: 1px solid var(--border-hairline);
-  border-bottom: 1px solid var(--border-hairline);
+  background: rgba(255, 255, 255, 0.08);
   cursor: row-resize;
-  transition: background-color 140ms ease;
-}
-
-.blinker-split-resizer:hover {
-  background: rgba(56, 189, 248, 0.45);
-}
-
-.blinker-sidebar-resizer {
-  width: 5px;
-  flex-shrink: 0;
-  background: rgba(148, 163, 184, 0.1);
-  border-right: 1px solid var(--border-hairline);
-  cursor: col-resize;
-  transition: background-color 140ms ease;
   z-index: 5;
 }
 
-.blinker-sidebar-resizer:hover {
-  background: rgba(56, 189, 248, 0.45);
+.blinker-split-resizer::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -3px;
+  bottom: -3px;
+}
+
+.blinker-split-resizer:hover,
+.blinker-split-resizer:active {
+  height: 3px;
+  background: #007fd4;
+}
+
+.blinker-sidebar-resizer {
+  position: relative;
+  width: 1px;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.08);
+  cursor: col-resize;
+  z-index: 5;
+}
+
+.blinker-sidebar-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  right: -3px;
+}
+
+.blinker-sidebar-resizer:hover,
+.blinker-sidebar-resizer:active {
+  width: 3px;
+  background: #007fd4;
+}
+
+.blinker-dtype-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid var(--border-hairline);
+  background: rgba(15, 23, 42, 0.85);
+  color: var(--text-secondary);
+}
+
+.blinker-dtype-pill.is-degraded {
+  border-color: rgba(245, 158, 11, 0.55);
+  background: rgba(245, 158, 11, 0.14);
+  color: var(--accent-amber-bright);
+}
+
+.blinker-dtype-pill.is-full {
+  border-color: rgba(56, 189, 248, 0.4);
+  background: rgba(56, 189, 248, 0.1);
+  color: #bae6fd;
+}
+
+.blinker-adjacent-btn {
+  position: absolute;
+  z-index: 7;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(11, 15, 23, 0.82);
+  backdrop-filter: blur(8px);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    color 140ms ease,
+    background-color 140ms ease;
+}
+
+.blinker-adjacent-btn:hover {
+  border-color: var(--accent-cyan);
+  color: var(--text-primary);
+  background: rgba(15, 23, 42, 0.94);
+}
+
+.blinker-adjacent-btn.is-north {
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.blinker-adjacent-btn.is-south {
+  bottom: 52px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.blinker-adjacent-btn.is-east {
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.blinker-adjacent-btn.is-west {
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
 }
 
 .blinker-canvas-stage {

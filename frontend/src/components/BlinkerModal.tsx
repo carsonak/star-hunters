@@ -33,6 +33,7 @@ const LazySpectraModal = React.lazy(() =>
 export const BlinkerModal: React.FC = () => {
   const { startAsyncTask } = useNotifications();
   const {
+    activePresetSlug,
     manifest,
     epochBuffers,
     flagsBuffers,
@@ -55,8 +56,17 @@ export const BlinkerModal: React.FC = () => {
     filteredEpochIndices = [],
     loadingState,
     retryActivePatch,
+    refetchActivePatch,
+    stepAdjacentPatch,
+    recentPatches = [],
+    clearRecentPatches,
+    fetchQualityMode = 'auto',
+    setFetchQualityMode,
+    activePatchDtype = 'float32',
+    isNetworkSlow = false,
     toggleMissionFilter,
     isBlinkerModalOpen = false,
+    openBlinkerModal,
     closeBlinkerModal,
     isSpectraModalOpen = false,
     openSelectedSpectrum,
@@ -121,9 +131,11 @@ export const BlinkerModal: React.FC = () => {
     sidebarCollapsed,
     sidebarWidth,
     splitRatio,
+    recentsFolded,
     controlsFolded,
     objectsFolded,
     toggleSidebarCollapsed,
+    toggleRecentsFold,
     toggleControlsFold,
     toggleObjectsFold,
     startSidebarWidthResize,
@@ -273,6 +285,10 @@ export const BlinkerModal: React.FC = () => {
     provenanceShortLabel: provenance.shortLabel,
   })}${manifest ? ` · ${formatRaDecCompact(manifest.query.ra, manifest.query.dec)}` : ''}`;
 
+  const activePatchId = activePresetSlug
+    ? `preset:${activePresetSlug}`
+    : (manifest?.query.grid_key ?? null);
+
   return (
     <div className="modal-backdrop" role="presentation" data-testid="blinker-modal-backdrop">
       <div
@@ -289,6 +305,10 @@ export const BlinkerModal: React.FC = () => {
           panX={renderSettings.panX}
           panY={renderSettings.panY}
           contrastStretch={renderSettings.contrastStretch}
+          fetchQualityMode={fetchQualityMode}
+          activePatchDtype={activePatchDtype}
+          isNetworkSlow={isNetworkSlow}
+          isRefetching={isCutoutLoading}
           title={manifest?.target_metadata.name ?? 'SPHEREx Sky Patch'}
           fullSubtitleText={fullSubtitleText}
           provenance={provenance}
@@ -298,6 +318,8 @@ export const BlinkerModal: React.FC = () => {
           onChangeContrast={(contrastStretch: ContrastStretch) =>
             updateRenderSettings({ contrastStretch })
           }
+          onChangeQualityMode={(nextMode) => setFetchQualityMode?.(nextMode)}
+          onRefetchPatch={() => refetchActivePatch?.()}
           onClose={closeBlinkerModal}
         />
 
@@ -320,17 +342,30 @@ export const BlinkerModal: React.FC = () => {
             <BlinkerSidebar
               sidebarWidth={sidebarWidth}
               splitRatio={splitRatio}
+              recentsFolded={recentsFolded}
               controlsFolded={controlsFolded}
               objectsFolded={objectsFolded}
+              onToggleRecentsFold={toggleRecentsFold}
               onToggleControlsFold={toggleControlsFold}
               onToggleObjectsFold={toggleObjectsFold}
               onStartSidebarWidthResize={startSidebarWidthResize}
               onStartSplitRatioResize={startSplitRatioResize}
+              recentPatches={recentPatches}
+              activePatchId={activePatchId}
+              onSelectRecentPatch={(entry) => {
+                if (entry.kind === 'preset' && entry.slug) {
+                  openBlinkerModal?.(entry.slug);
+                } else {
+                  openBlinkerModal?.({ ra: entry.ra, dec: entry.dec, fovArcmin: entry.fovArcmin });
+                }
+              }}
+              onClearRecentPatches={clearRecentPatches}
               renderSettings={renderSettings}
               updateRenderSettings={updateRenderSettings}
               allowedEpochIndices={allowedEpochIndices}
               availableMissions={availableMissions}
               activeMissions={activeMissions}
+              primaryMission={manifest?.data_source_summary?.primary_mission}
               toggleMissionFilter={toggleMissionFilter}
               knownObjects={knownObjects}
               checkedIdSet={checkedIdSet}
@@ -432,6 +467,51 @@ export const BlinkerModal: React.FC = () => {
               onToggleLoop={playback.toggleLoop}
               onSetFps={playback.setFps}
             />
+
+            {stepAdjacentPatch && (
+              <>
+                <button
+                  type="button"
+                  className="blinker-adjacent-btn is-north"
+                  data-testid="blinker-step-north"
+                  title="Step to adjacent sky patch North (+0.05° Dec)"
+                  aria-label="Step to adjacent sky patch North"
+                  onClick={() => stepAdjacentPatch('north')}
+                >
+                  ↑ N
+                </button>
+                <button
+                  type="button"
+                  className="blinker-adjacent-btn is-south"
+                  data-testid="blinker-step-south"
+                  title="Step to adjacent sky patch South (-0.05° Dec)"
+                  aria-label="Step to adjacent sky patch South"
+                  onClick={() => stepAdjacentPatch('south')}
+                >
+                  ↓ S
+                </button>
+                <button
+                  type="button"
+                  className="blinker-adjacent-btn is-east"
+                  data-testid="blinker-step-east"
+                  title="Step to adjacent sky patch East (+0.05° RA)"
+                  aria-label="Step to adjacent sky patch East"
+                  onClick={() => stepAdjacentPatch('east')}
+                >
+                  ← E
+                </button>
+                <button
+                  type="button"
+                  className="blinker-adjacent-btn is-west"
+                  data-testid="blinker-step-west"
+                  title="Step to adjacent sky patch West (-0.05° RA)"
+                  aria-label="Step to adjacent sky patch West"
+                  onClick={() => stepAdjacentPatch('west')}
+                >
+                  W →
+                </button>
+              </>
+            )}
           </div>
         </div>
       </div>

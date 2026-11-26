@@ -15,7 +15,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from app.models.contracts import (
     SHOWCASE_TARGETS,
@@ -69,6 +69,24 @@ CPU_PRIORITY_SKY_PATCH = 10
 DEFAULT_CPU_STARVATION_THRESHOLD_S = 2.0
 
 
+class _WaiterEntry(NamedTuple):
+    """Queued waiter entry for ``_AgingPrioritySemaphore``.
+
+    Attributes:
+        priority: Caller priority (lower values are dispatched first).
+        enqueued_at: Monotonic timestamp when the waiter was queued, used for
+            aging/starvation promotion and oldest-first ordering.
+        seq: Monotonically increasing sequence number for deterministic FIFO
+            tie-breaking when timestamps match.
+        future: Future resolved by ``release()`` when this waiter wins a slot.
+    """
+
+    priority: int
+    enqueued_at: float
+    seq: int
+    future: asyncio.Future[None]
+
+
 class _AgingPrioritySemaphore:
     """Async semaphore with priority ordering and anti-starvation aging."""
 
@@ -81,11 +99,11 @@ class _AgingPrioritySemaphore:
         self._starvation_threshold_s = max(0.01, float(starvation_threshold_s))
         self._in_use = 0
         self._seq = 0
-        self._waiters: list[tuple[int, float, int, asyncio.Future[None]]] = []
+        self._waiters: list[_WaiterEntry] = []
 
     def _prune_done_waiters(self) -> None:
         if self._waiters:
-            self._waiters = [w for w in self._waiters if not w[3].done()]
+            self._waiters = [w for w in self._waiters if not w.future.done()]
 
     async def acquire(self, priority: int) -> None:
         """Acquire a CPU slot, queueing by priority when saturated."""
@@ -96,7 +114,12 @@ class _AgingPrioritySemaphore:
 
         fut = asyncio.get_running_loop().create_future()
         self._seq += 1
-        entry = (priority, time.monotonic(), self._seq, fut)
+        entry = _WaiterEntry(
+            priority=priority,
+            enqueued_at=time.monotonic(),
+            seq=self._seq,
+            future=fut,
+        )
         self._waiters.append(entry)
         try:
             await fut
@@ -116,16 +139,21 @@ class _AgingPrioritySemaphore:
 
         now = time.monotonic()
         best_idx = 0
+        # Sort key: (starvation_tier [0=starved, 1=normal], effective_priority, enqueued_at, seq)
         best_key: tuple[int, int, float, int] | None = None
-        for idx, (prio, enq, seq, _fut) in enumerate(self._waiters):
-            starved = (now - enq) >= self._starvation_threshold_s
-            key = (0, 0, enq, seq) if starved else (1, prio, enq, seq)
+        for idx, waiter in enumerate(self._waiters):
+            starved = (now - waiter.enqueued_at) >= self._starvation_threshold_s
+            key = (
+                (0, 0, waiter.enqueued_at, waiter.seq)
+                if starved
+                else (1, waiter.priority, waiter.enqueued_at, waiter.seq)
+            )
             if best_key is None or key < best_key:
                 best_key = key
                 best_idx = idx
 
-        _prio, _enq, _seq, winner_fut = self._waiters.pop(best_idx)
-        winner_fut.set_result(None)
+        winner = self._waiters.pop(best_idx)
+        winner.future.set_result(None)
 
     @asynccontextmanager
     async def slot(self, priority: int) -> AsyncIterator[None]:
@@ -800,6 +828,10 @@ class StarHuntersBackendService:
                 validate_sky_patch_manifest(cached_manifest)
                 return cached_manifest
 
+        stale_manifest = self.cache.get_manifest(grid_key, allow_stale=True)
+        if stale_manifest is not None and self._is_pending_archival_demo(stale_manifest):
+            stale_manifest = None
+
         manifest = build_sky_patch_manifest_payload(ra=ra, dec=dec, fov_arcmin=fov)
         manifest = self._apply_cached_pipeline_sync(manifest, ra=ra, dec=dec, fov=fov)
         slug = manifest["target_metadata"]["slug"]
@@ -808,14 +840,33 @@ class StarHuntersBackendService:
         frames = generate_synthetic_epoch_frames(slug=slug, manifest=manifest)
 
         if self.enable_archival_data:
-            manifest, frames = self.archival_resolver.resolve_archival_patch_sync(
-                manifest=manifest,
-                grid_key=grid_key,
-                ra=ra,
-                dec=dec,
-                fov=fov,
-                fallback_frames=frames,
-            )
+            try:
+                manifest, frames = self.archival_resolver.resolve_archival_patch_sync(
+                    manifest=manifest,
+                    grid_key=grid_key,
+                    ra=ra,
+                    dec=dec,
+                    fov=fov,
+                    fallback_frames=frames,
+                )
+            except Exception as exc:
+                if stale_manifest is not None:
+                    _logger.warning(
+                        "Archival refresh failed for %s (%s); serving stale cached patch",
+                        grid_key,
+                        exc,
+                    )
+                    validate_sky_patch_manifest(stale_manifest)
+                    return stale_manifest
+                raise
+            if (
+                stale_manifest is not None
+                and manifest.get("data_source_summary", {}).get("provenance_tier") == "simulated"
+                and stale_manifest.get("data_source_summary", {}).get("provenance_tier")
+                != "simulated"
+            ):
+                validate_sky_patch_manifest(stale_manifest)
+                return stale_manifest
             manifest = self._apply_cached_pipeline_sync(manifest, ra=ra, dec=dec, fov=fov)
             manifest, frames = apply_solar_system_ephemeris_to_frames(manifest, frames)
 
@@ -868,6 +919,17 @@ class StarHuntersBackendService:
                 validate_sky_patch_manifest(cached_manifest)
                 return cached_manifest
 
+        stale_manifest: dict[str, Any] | None = None
+        if cached_manifest is None:
+            stale_manifest = self.cache.peek_manifest_memory(grid_key, allow_stale=True)
+            if stale_manifest is None:
+                stale_manifest = await loop.run_in_executor(
+                    self._io_executor,
+                    functools.partial(self.cache.get_manifest, grid_key, allow_stale=True),
+                )
+            if stale_manifest is not None and self._is_pending_archival_demo(stale_manifest):
+                stale_manifest = None
+
         sf_key = f"patch:{grid_key}:arch{int(self.enable_archival_data)}:live{int(live_catalogs)}"
         existing_sf = self._inflight_tasks.get(sf_key)
         is_coalesced = (
@@ -876,6 +938,9 @@ class StarHuntersBackendService:
         if client_ip and not is_coalesced:
             allowed, retry_after_s = self._cold_miss_limiter.allow(client_ip)
             if not allowed:
+                if stale_manifest is not None:
+                    validate_sky_patch_manifest(stale_manifest)
+                    return stale_manifest
                 raise ColdMissRateLimitError(
                     retry_after_s=retry_after_s,
                     limit_per_min=self._cold_miss_limiter.limit_per_min,
@@ -1005,6 +1070,19 @@ class StarHuntersBackendService:
                 pipeline_result, (resolved_manifest, frames) = await asyncio.gather(
                     catalog_coro, _resolve_archival_bounded()
                 )
+                if (
+                    stale_manifest is not None
+                    and resolved_manifest.get("data_source_summary", {}).get("provenance_tier")
+                    == "simulated"
+                    and stale_manifest.get("data_source_summary", {}).get("provenance_tier")
+                    != "simulated"
+                ):
+                    _logger.warning(
+                        "Archival refresh degraded to simulated for %s; serving stale cached patch",
+                        grid_key,
+                    )
+                    validate_sky_patch_manifest(stale_manifest)
+                    return stale_manifest
             else:
                 pipeline_result, frames = await asyncio.gather(catalog_coro, frames_fut)
                 resolved_manifest = base_manifest
@@ -1258,28 +1336,41 @@ class StarHuntersBackendService:
             validate_spectrum_payload(cached_spec)
             return cached_spec
 
+        stale_spec = self.cache.get_spectrum(spectrum_key, allow_stale=True)
         try:
-            cutouts = self.spherex_cutout_fetcher(
+            try:
+                cutouts = self.spherex_cutout_fetcher(
+                    ra=ra,
+                    dec=dec,
+                    fov_arcmin=5.0,
+                    allow_synthetic_fallback=True,
+                    max_cutouts=DEFAULT_MAX_SPECTRUM_CUTOUTS,
+                    budget_seconds=13.0,
+                )
+            except TypeError:
+                cutouts = self.spherex_cutout_fetcher(
+                    ra=ra,
+                    dec=dec,
+                    fov_arcmin=5.0,
+                    allow_synthetic_fallback=True,
+                )
+            payload = self.spectrum_extractor(
                 ra=ra,
                 dec=dec,
-                fov_arcmin=5.0,
-                allow_synthetic_fallback=True,
-                max_cutouts=DEFAULT_MAX_SPECTRUM_CUTOUTS,
-                budget_seconds=13.0,
+                cutouts=cutouts,
+                source_label=resolved_label,
             )
-        except TypeError:
-            cutouts = self.spherex_cutout_fetcher(
-                ra=ra,
-                dec=dec,
-                fov_arcmin=5.0,
-                allow_synthetic_fallback=True,
-            )
-        payload = self.spectrum_extractor(
-            ra=ra,
-            dec=dec,
-            cutouts=cutouts,
-            source_label=resolved_label,
-        )
+        except Exception as exc:
+            if stale_spec is not None:
+                _logger.warning(
+                    "Spectrum refresh failed for %s (%s); serving stale cached spectrum",
+                    spectrum_key,
+                    exc,
+                )
+                stale_spec["source_label"] = resolved_label
+                validate_spectrum_payload(stale_spec)
+                return stale_spec
+            raise
         self.cache.put_spectrum(spectrum_key=spectrum_key, ra=ra, dec=dec, payload=payload)
         return payload
 
@@ -1314,6 +1405,16 @@ class StarHuntersBackendService:
         if client_ip and not is_coalesced:
             allowed, retry_after_s = self._cold_miss_limiter.allow(client_ip)
             if not allowed:
+                stale_spec = self.cache.peek_spectrum_memory(spectrum_key, allow_stale=True)
+                if stale_spec is None:
+                    stale_spec = await loop.run_in_executor(
+                        self._io_executor,
+                        functools.partial(self.cache.get_spectrum, spectrum_key, allow_stale=True),
+                    )
+                if stale_spec is not None:
+                    stale_spec["source_label"] = resolved_label
+                    validate_spectrum_payload(stale_spec)
+                    return stale_spec
                 raise ColdMissRateLimitError(
                     retry_after_s=retry_after_s,
                     limit_per_min=self._cold_miss_limiter.limit_per_min,

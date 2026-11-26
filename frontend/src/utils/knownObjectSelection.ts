@@ -40,6 +40,141 @@ export const WAVELENGTH_PRESETS: ReadonlyArray<WavelengthPreset> = [
   { id: 'hot', label: 'Hot Stars (0.75–2.4 µm)', shortLabel: 'Hot 0.75-2.4', range: [0.75, 2.4] },
 ];
 
+/** Mission-specific wavelength slider bounds, step, and quick-filter presets. */
+export interface MissionWavelengthConfig {
+  isMissionRestricted: boolean;
+  /** Full spectrum rail lower bound (`0.65 µm`). */
+  railMin: number;
+  /** Full spectrum rail upper bound (`5.0 µm`). */
+  railMax: number;
+  /** Mission-clamped minimum thumb bound in µm. */
+  min: number;
+  /** Mission-clamped maximum thumb bound in µm. */
+  max: number;
+  step: number;
+  minGap: number;
+  defaultRange: [number, number];
+  presets: ReadonlyArray<WavelengthPreset>;
+}
+
+const RAIL_MIN_UM = 0.65;
+const RAIL_MAX_UM = 5.0;
+
+const SPHEREX_WAVELENGTH_CONFIG: MissionWavelengthConfig = {
+  isMissionRestricted: false,
+  railMin: RAIL_MIN_UM,
+  railMax: RAIL_MAX_UM,
+  min: 0.75,
+  max: 5.0,
+  step: 0.05,
+  minGap: 0.15,
+  defaultRange: [0.75, 5.0],
+  presets: WAVELENGTH_PRESETS,
+};
+
+const SKYVIEW_WAVELENGTH_CONFIG: MissionWavelengthConfig = {
+  isMissionRestricted: true,
+  railMin: RAIL_MIN_UM,
+  railMax: RAIL_MAX_UM,
+  min: 0.65,
+  max: 0.85,
+  step: 0.05,
+  minGap: 0.05,
+  defaultRange: [0.65, 0.85],
+  presets: WAVELENGTH_PRESETS,
+};
+
+const WISE_WAVELENGTH_CONFIG: MissionWavelengthConfig = {
+  isMissionRestricted: true,
+  railMin: RAIL_MIN_UM,
+  railMax: RAIL_MAX_UM,
+  min: 2.4,
+  max: 5.0,
+  step: 0.05,
+  minGap: 0.15,
+  defaultRange: [2.4, 5.0],
+  presets: WAVELENGTH_PRESETS,
+};
+
+/**
+ * Resolve the wavelength slider bounds for the active mission(s) on the full
+ * `0.65–5.0 µm` spectrum rail.
+ *
+ * - `SkyView`-only: knobs clamp to `[0.65, 0.85]` µm (DSS2 Red/IR).
+ * - `WISE`-only: knobs clamp to `[2.4, 5.0]` µm (W1/W2).
+ * - `SPHEREx` / mixed / default: knobs clamp to `[0.75, 5.0]` µm.
+ *
+ * @param availableMissions - Missions present in the loaded patch manifest.
+ * @param activeMissions - Currently enabled mission filter pills.
+ * @param primaryMission - Optional `data_source_summary.primary_mission` fallback.
+ * @returns Resolved {@link MissionWavelengthConfig}.
+ */
+export function resolveWavelengthConfigForMissions(
+  availableMissions: ReadonlyArray<MissionSourceCount>,
+  activeMissions: ReadonlyArray<MissionName>,
+  primaryMission?: MissionName,
+): MissionWavelengthConfig {
+  const enabledInPatch = availableMissions
+    .filter((entry) => activeMissions.includes(entry.mission))
+    .map((entry) => entry.mission);
+
+  const soleMission =
+    enabledInPatch.length === 1
+      ? enabledInPatch[0]
+      : enabledInPatch.length === 0
+        ? primaryMission
+        : undefined;
+
+  if (soleMission === 'SkyView') return SKYVIEW_WAVELENGTH_CONFIG;
+  if (soleMission === 'WISE') return WISE_WAVELENGTH_CONFIG;
+  return SPHEREX_WAVELENGTH_CONFIG;
+}
+
+/**
+ * Determine whether a wavelength quick-filter preset falls within the active
+ * mission's allowed `[min, max]` bounds.
+ *
+ * @param range - Preset `[minUm, maxUm]` bounds.
+ * @param config - Active {@link MissionWavelengthConfig}.
+ * @returns `true` if the preset is selectable for the active mission.
+ */
+export function isWavelengthPresetEnabled(
+  range: readonly [number, number],
+  config: Pick<MissionWavelengthConfig, 'min' | 'max'>,
+): boolean {
+  return range[0] >= config.min - 1e-6 && range[1] <= config.max + 1e-6;
+}
+
+/**
+ * Clamp or reset a wavelength `[minUm, maxUm]` range when switching between
+ * mission wavelength regimes (e.g. SPHEREx <-> SkyView <-> WISE).
+ *
+ * @param currentRange - Previously active `[minUm, maxUm]` range.
+ * @param nextConfig - Target mission's {@link MissionWavelengthConfig}.
+ * @param prevConfig - Previous mission's {@link MissionWavelengthConfig}, if known.
+ * @returns Validated `[minUm, maxUm]` range within `nextConfig`.
+ */
+export function reconcileWavelengthRange(
+  currentRange: readonly [number, number],
+  nextConfig: MissionWavelengthConfig,
+  prevConfig?: MissionWavelengthConfig,
+): [number, number] {
+  if (prevConfig && (prevConfig.min !== nextConfig.min || prevConfig.max !== nextConfig.max)) {
+    return [...nextConfig.defaultRange];
+  }
+  const [lo, hi] = currentRange;
+  if (
+    !Number.isFinite(lo) ||
+    !Number.isFinite(hi) ||
+    lo < nextConfig.min - 1e-6 ||
+    hi > nextConfig.max + 1e-6 ||
+    (nextConfig.max > 0.85 + 1e-6 && hi <= 0.85 + 1e-6)
+  ) {
+    return [...nextConfig.defaultRange];
+  }
+  return [lo, hi];
+}
+
 const PRESET_MATCH_TOLERANCE_UM = 0.05;
 
 /**

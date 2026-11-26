@@ -4,6 +4,10 @@ export interface DualThumbRangeSliderProps {
   label: string;
   min: number;
   max: number;
+  /** Optional inner lower bound for thumb movement on the full `[min, max]` rail. */
+  allowedMin?: number;
+  /** Optional inner upper bound for thumb movement on the full `[min, max]` rail. */
+  allowedMax?: number;
   step: number;
   minGap?: number;
   value: [number, number];
@@ -26,6 +30,8 @@ export const DualThumbRangeSlider: React.FC<DualThumbRangeSliderProps> = ({
   label,
   min,
   max,
+  allowedMin,
+  allowedMax,
   step,
   minGap = step,
   value,
@@ -39,8 +45,11 @@ export const DualThumbRangeSlider: React.FC<DualThumbRangeSliderProps> = ({
   const railRef = useRef<HTMLDivElement | null>(null);
   const activeThumbRef = useRef<'low' | 'high' | null>(null);
 
-  const low = Math.max(min, Math.min(max, value[0]));
-  const high = Math.max(min, Math.min(max, value[1]));
+  const effectiveMin = Math.max(min, Math.min(max, allowedMin ?? min));
+  const effectiveMax = Math.max(effectiveMin, Math.min(max, allowedMax ?? max));
+
+  const low = Math.max(effectiveMin, Math.min(effectiveMax, value[0]));
+  const high = Math.max(effectiveMin, Math.min(effectiveMax, value[1]));
   const span = Math.max(1e-6, max - min);
   const lowPct = ((low - min) / span) * 100;
   const highPct = ((high - min) / span) * 100;
@@ -50,22 +59,22 @@ export const DualThumbRangeSlider: React.FC<DualThumbRangeSliderProps> = ({
       const rect = railRef.current?.getBoundingClientRect();
       if (!rect || rect.width <= 0) return low;
       const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-      return quantize(min + ratio * (max - min), min, max, step);
+      return quantize(min + ratio * (max - min), effectiveMin, effectiveMax, step);
     },
-    [low, max, min, step],
+    [effectiveMax, effectiveMin, low, max, min, step],
   );
 
   const commitThumbMove = useCallback(
     (which: 'low' | 'high', rawTarget: number) => {
       if (which === 'low') {
         const clampedLow = Math.min(rawTarget, high - minGap);
-        onChange([quantize(clampedLow, min, max, step), high]);
+        onChange([quantize(clampedLow, effectiveMin, effectiveMax, step), high]);
       } else {
         const clampedHigh = Math.max(rawTarget, low + minGap);
-        onChange([low, quantize(clampedHigh, min, max, step)]);
+        onChange([low, quantize(clampedHigh, effectiveMin, effectiveMax, step)]);
       }
     },
-    [high, low, max, min, minGap, onChange, step],
+    [effectiveMax, effectiveMin, high, low, minGap, onChange, step],
   );
 
   const handleTrackPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -150,8 +159,8 @@ export const DualThumbRangeSlider: React.FC<DualThumbRangeSliderProps> = ({
           className="dual-slider-thumb"
           style={{ left: `${lowPct}%` }}
           aria-label={lowAriaLabel ?? `${label} minimum`}
-          aria-valuemin={min}
-          aria-valuemax={max - minGap}
+          aria-valuemin={effectiveMin}
+          aria-valuemax={effectiveMax - minGap}
           aria-valuenow={low}
           onPointerDown={(e) => {
             e.stopPropagation();
@@ -167,8 +176,8 @@ export const DualThumbRangeSlider: React.FC<DualThumbRangeSliderProps> = ({
           className="dual-slider-thumb"
           style={{ left: `${highPct}%` }}
           aria-label={highAriaLabel ?? `${label} maximum`}
-          aria-valuemin={min + minGap}
-          aria-valuemax={max}
+          aria-valuemin={effectiveMin + minGap}
+          aria-valuemax={effectiveMax}
           aria-valuenow={high}
           onPointerDown={(e) => {
             e.stopPropagation();

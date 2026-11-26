@@ -2,13 +2,19 @@ import type {
   BinaryDtype,
   CatalogsResponse,
   EpochManifestEntry,
+  FetchQualityMode,
   SkyPatchManifest,
   SpectrumPayload,
 } from '../types/contracts.ts';
 import { decodeDetectorBinaryBuffer, decodeFlagsBinaryBuffer } from '../utils/binaryDecoder.ts';
+import {
+  AUTO_FLOAT32_STALL_MS,
+  defaultNetworkQualityTracker,
+  type NetworkQualityTracker,
+} from '../utils/networkQuality.ts';
 import { observatoryLogger } from '../utils/observatoryLogger.ts';
 import { computeGridKey } from '../utils/wcsViewport.ts';
-import type { ClientPatchCache } from './clientPatchCache.ts';
+import { livePatchCacheKey, type ClientPatchCache } from './clientPatchCache.ts';
 
 /** Progressive two-stage loading state emitted during preset and live sky patch loads. */
 export type ProgressiveLoadingStage =
@@ -25,12 +31,15 @@ export interface LoadedPatchResult {
   flagsBuffers: Uint8Array[];
   spectrum: SpectrumPayload | null;
   fromClientCache: boolean;
+  loadedDtype?: BinaryDtype;
+  degradedOnAutoFallback?: boolean;
 }
 
 /** Terminal outcome of a progressive patch loading flow. */
 export interface FlowOutcome {
   aborted: boolean;
   fromClientCache?: boolean;
+  loadedDtype?: BinaryDtype;
 }
 
 /** Minimal `fetch` function signature accepted for dependency injection in tests. */
@@ -41,6 +50,7 @@ export interface PresetFlowOptions {
   cache: ClientPatchCache;
   fetchImpl?: FetchLike;
   signal?: AbortSignal;
+  bypassClientCache?: boolean;
   onStageChange?: (state: ProgressiveLoadingStage) => void;
   onReady: (result: LoadedPatchResult) => void;
 }
@@ -50,6 +60,10 @@ export interface LiveFlowOptions {
   cache: ClientPatchCache;
   fetchImpl?: FetchLike;
   signal?: AbortSignal;
+  qualityMode?: FetchQualityMode;
+  networkTracker?: NetworkQualityTracker;
+  bypassClientCache?: boolean;
+  stallTimeoutMs?: number;
   onStageChange?: (state: ProgressiveLoadingStage) => void;
   onCatalogsReady?: (catalogs: CatalogsResponse) => void;
   onReady: (result: LoadedPatchResult) => void;
@@ -69,11 +83,15 @@ export const PRESET_FETCH_TIMEOUT_MS = 15_000;
 interface FetchPatchBundleOptions {
   cache: ClientPatchCache;
   cacheKey: string;
+  liveGridKey?: string;
   manifest: SkyPatchManifest;
   fetchImpl: FetchLike;
   signal?: AbortSignal;
-  preferFloat16: boolean;
-  defaultDtype: BinaryDtype;
+  targetDtype: BinaryDtype;
+  appendPrecisionQuery: boolean;
+  autoFallbackToFloat16: boolean;
+  stallTimeoutMs: number;
+  networkTracker: NetworkQualityTracker;
   prefetchSpectrum: boolean;
   frameTimeoutMs?: number;
   onReady: (result: LoadedPatchResult) => void;
@@ -151,83 +169,182 @@ async function readErrorDetail(res: Response, fallbackPrefix: string): Promise<s
  */
 async function tryServeCachedPatch(
   cache: ClientPatchCache,
-  cacheKey: string,
+  cacheKeys: ReadonlyArray<string>,
   signal: AbortSignal | undefined,
   onReady: (result: LoadedPatchResult) => void,
 ): Promise<FlowOutcome | null> {
-  const cached = await cache.getPatch(cacheKey);
-  if (signal?.aborted) return { aborted: true };
-  if (!cached) return null;
+  for (const key of cacheKeys) {
+    const cached = await cache.getPatch(key);
+    if (signal?.aborted) return { aborted: true };
+    if (cached) {
+      const loadedDtype: BinaryDtype = cached.dtype ?? 'float32';
+      onReady({
+        manifest: cached.manifest,
+        epochBuffers: cached.epochBuffers,
+        flagsBuffers: cached.flagsBuffers,
+        spectrum: cached.spectrum ?? null,
+        fromClientCache: true,
+        loadedDtype,
+      });
+      return { aborted: false, fromClientCache: true, loadedDtype };
+    }
+  }
+  return null;
+}
 
-  onReady({
-    manifest: cached.manifest,
-    epochBuffers: cached.epochBuffers,
-    flagsBuffers: cached.flagsBuffers,
-    spectrum: cached.spectrum ?? null,
-    fromClientCache: true,
-  });
-  return { aborted: false, fromClientCache: true };
+function buildDetectorFrameUrl(
+  baseUrl: string,
+  precision: BinaryDtype,
+  appendQuery: boolean,
+): string {
+  if (!appendQuery || baseUrl.includes('?')) {
+    return baseUrl;
+  }
+  return `${baseUrl}?precision=${precision}`;
+}
+
+async function fetchDetectorWithThroughput(
+  fetchImpl: FetchLike,
+  url: string,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+  networkTracker: NetworkQualityTracker,
+): Promise<{ res: Response; buf: ArrayBuffer }> {
+  const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const res = await fetchWithTimeout(fetchImpl, url, signal, timeoutMs, 'Detector frame');
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to load detector frame'));
+  }
+  const buf = await res.arrayBuffer();
+  const endedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const headerLen = Number(res.headers?.get?.('content-length'));
+  const bytes = Number.isFinite(headerLen) && headerLen > 0 ? headerLen : buf.byteLength;
+  networkTracker.recordTransfer(bytes, Math.max(1, endedAt - startedAt));
+  return { res, buf };
 }
 
 /**
  * Fetch and decode the 6-detector binary cube and 8-bit hygiene flags mask for one epoch.
- *
- * @param epoch - Epoch descriptor from a {@link SkyPatchManifest}.
- * @param options - Fetch implementation, abort signal, and binary precision hints.
- * @returns Decoded detector planes (`Float32Array[6]`) and hygiene flag mask (`Uint8Array`).
- * @throws {Error} When either the detector frame or flags frame HTTP request fails.
  */
 async function fetchDecodedEpoch(
   epoch: EpochManifestEntry,
   options: {
     fetchImpl: FetchLike;
     signal?: AbortSignal;
-    preferFloat16: boolean;
-    defaultDtype: BinaryDtype;
+    targetDtype: BinaryDtype;
+    appendPrecisionQuery: boolean;
+    autoFallbackToFloat16: boolean;
+    stallTimeoutMs: number;
+    networkTracker: NetworkQualityTracker;
     frameTimeoutMs?: number;
   },
-): Promise<{ detectors: Float32Array[]; flags: Uint8Array }> {
+): Promise<{
+  detectors: Float32Array[];
+  flags: Uint8Array;
+  dtype: BinaryDtype;
+  degraded: boolean;
+}> {
   const {
     fetchImpl,
     signal,
-    preferFloat16,
-    defaultDtype,
+    targetDtype,
+    appendPrecisionQuery,
+    autoFallbackToFloat16,
+    stallTimeoutMs,
+    networkTracker,
     frameTimeoutMs = FRAME_FETCH_TIMEOUT_MS,
   } = options;
-  const detUrl =
-    preferFloat16 && !epoch.detectors_data_url.includes('?')
-      ? `${epoch.detectors_data_url}?precision=float16`
-      : epoch.detectors_data_url;
 
-  const [detRes, flagRes] = await Promise.all([
-    fetchWithTimeout(fetchImpl, detUrl, signal, frameTimeoutMs, 'Detector frame'),
-    fetchWithTimeout(fetchImpl, epoch.flags_mask_url, signal, frameTimeoutMs, 'Flags frame'),
-  ]);
+  const flagPromise = fetchWithTimeout(
+    fetchImpl,
+    epoch.flags_mask_url,
+    signal,
+    frameTimeoutMs,
+    'Flags frame',
+  ).then(async (flagRes) => {
+    if (!flagRes.ok) {
+      throw new Error(await readErrorDetail(flagRes, 'Failed to load flags frame'));
+    }
+    return flagRes.arrayBuffer();
+  });
+
+  let detRes: Response;
+  let detBuf: ArrayBuffer;
+  let flagBuf: ArrayBuffer;
+  let degraded = false;
+
+  try {
+    const primaryUrl = buildDetectorFrameUrl(
+      epoch.detectors_data_url,
+      targetDtype,
+      appendPrecisionQuery,
+    );
+    if (autoFallbackToFloat16 && targetDtype === 'float32' && appendPrecisionQuery) {
+      try {
+        const result = await fetchDetectorWithThroughput(
+          fetchImpl,
+          primaryUrl,
+          signal,
+          Math.min(frameTimeoutMs, stallTimeoutMs),
+          networkTracker,
+        );
+        detRes = result.res;
+        detBuf = result.buf;
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        networkTracker.recordStall();
+        degraded = true;
+        observatoryLogger.warn(
+          'patch_loader',
+          'Auto-downgrading stalled float32 frame to float16',
+          {
+            url: primaryUrl,
+            reason: err instanceof Error ? err.message : 'stall',
+          },
+        );
+        const fallbackUrl = buildDetectorFrameUrl(epoch.detectors_data_url, 'float16', true);
+        const fallback = await fetchDetectorWithThroughput(
+          fetchImpl,
+          fallbackUrl,
+          signal,
+          frameTimeoutMs,
+          networkTracker,
+        );
+        detRes = fallback.res;
+        detBuf = fallback.buf;
+      }
+    } else {
+      const result = await fetchDetectorWithThroughput(
+        fetchImpl,
+        primaryUrl,
+        signal,
+        frameTimeoutMs,
+        networkTracker,
+      );
+      detRes = result.res;
+      detBuf = result.buf;
+    }
+
+    flagBuf = await flagPromise;
+  } catch (err) {
+    await flagPromise.catch(() => undefined);
+    throw err;
+  }
   if (signal?.aborted) {
     const abortErr = new Error('Aborted');
     abortErr.name = 'AbortError';
     throw abortErr;
   }
-  if (!detRes.ok) {
-    throw new Error(await readErrorDetail(detRes, 'Failed to load detector frame'));
-  }
-  if (!flagRes.ok) {
-    throw new Error(await readErrorDetail(flagRes, 'Failed to load flags frame'));
-  }
-
-  const [detBuf, flagBuf] = await Promise.all([detRes.arrayBuffer(), flagRes.arrayBuffer()]);
-  if (signal?.aborted) {
-    const abortErr = new Error('Aborted');
-    abortErr.name = 'AbortError';
-    throw abortErr;
-  }
-  const headerDtype = (detRes.headers.get('X-Binary-Dtype') ||
+  const headerDtype = (detRes.headers?.get?.('X-Binary-Dtype') ||
+    (degraded ? 'float16' : targetDtype) ||
     epoch.binary_dtype ||
-    defaultDtype) as BinaryDtype;
+    'float32') as BinaryDtype;
 
   return {
     detectors: decodeDetectorBinaryBuffer(detBuf, headerDtype),
     flags: decodeFlagsBinaryBuffer(flagBuf),
+    dtype: headerDtype,
+    degraded,
   };
 }
 
@@ -235,26 +352,36 @@ async function fetchDecodedEpoch(
  * Concurrently fetch and decode all epoch binary buffers and optional default
  * spectrum for a manifest, persist the bundle in {@link ClientPatchCache}, and
  * invoke `onReady`.
- *
- * @param options - Manifest, cache target, fetch implementation, and callbacks.
- * @returns Flow completion status (`aborted: true` if cancelled before completion).
  */
 async function fetchAndCachePatchBundle(options: FetchPatchBundleOptions): Promise<FlowOutcome> {
   const {
     cache,
     cacheKey,
+    liveGridKey,
     manifest,
     fetchImpl,
     signal,
-    preferFloat16,
-    defaultDtype,
+    targetDtype,
+    appendPrecisionQuery,
+    autoFallbackToFloat16,
+    stallTimeoutMs,
+    networkTracker,
     prefetchSpectrum,
     frameTimeoutMs,
     onReady,
   } = options;
 
   const epochPromises = manifest.epochs.map((epoch) =>
-    fetchDecodedEpoch(epoch, { fetchImpl, signal, preferFloat16, defaultDtype, frameTimeoutMs }),
+    fetchDecodedEpoch(epoch, {
+      fetchImpl,
+      signal,
+      targetDtype,
+      appendPrecisionQuery,
+      autoFallbackToFloat16,
+      stallTimeoutMs,
+      networkTracker,
+      frameTimeoutMs,
+    }),
   );
   const spectrumPromise =
     prefetchSpectrum && manifest.default_spectrum_url
@@ -277,10 +404,16 @@ async function fetchAndCachePatchBundle(options: FetchPatchBundleOptions): Promi
 
   const epochBuffers = decodedEpochs.map((entry) => entry.detectors);
   const flagsBuffers = decodedEpochs.map((entry) => entry.flags);
+  const actualDtype: BinaryDtype = decodedEpochs.some((e) => e.dtype === 'float16')
+    ? 'float16'
+    : 'float32';
+  const degradedOnAutoFallback = decodedEpochs.some((e) => e.degraded);
+  const resolvedCacheKey = liveGridKey ? livePatchCacheKey(liveGridKey, actualDtype) : cacheKey;
 
   const now = Date.now();
   await cache.putPatch({
-    cacheKey,
+    cacheKey: resolvedCacheKey,
+    dtype: actualDtype,
     manifest,
     epochBuffers,
     flagsBuffers,
@@ -296,8 +429,10 @@ async function fetchAndCachePatchBundle(options: FetchPatchBundleOptions): Promi
     flagsBuffers,
     spectrum: loadedSpectrum,
     fromClientCache: false,
+    loadedDtype: actualDtype,
+    degradedOnAutoFallback,
   });
-  return { aborted: false, fromClientCache: false };
+  return { aborted: false, fromClientCache: false, loadedDtype: actualDtype };
 }
 
 /**
@@ -314,11 +449,20 @@ export async function loadPresetPatchFlow(
   slug: string,
   options: PresetFlowOptions,
 ): Promise<FlowOutcome> {
-  const { cache, fetchImpl = fetch, signal, onStageChange, onReady } = options;
+  const {
+    cache,
+    fetchImpl = fetch,
+    signal,
+    bypassClientCache = false,
+    onStageChange,
+    onReady,
+  } = options;
   const cacheKey = `preset:${slug}`;
 
-  const cacheOutcome = await tryServeCachedPatch(cache, cacheKey, signal, onReady);
-  if (cacheOutcome) return cacheOutcome;
+  if (!bypassClientCache) {
+    const cacheOutcome = await tryServeCachedPatch(cache, [cacheKey], signal, onReady);
+    if (cacheOutcome) return cacheOutcome;
+  }
 
   onStageChange?.({ stage: 'loading_cutouts', message: `Loading preset ${slug}...` });
   const manifestRes = await fetchWithTimeout(
@@ -341,8 +485,11 @@ export async function loadPresetPatchFlow(
     manifest: loadedManifest,
     fetchImpl,
     signal,
-    preferFloat16: false,
-    defaultDtype: 'float32',
+    targetDtype: 'float32',
+    appendPrecisionQuery: false,
+    autoFallbackToFloat16: false,
+    stallTimeoutMs: AUTO_FLOAT32_STALL_MS,
+    networkTracker: defaultNetworkQualityTracker,
     prefetchSpectrum: true,
     onReady,
   });
@@ -350,15 +497,7 @@ export async function loadPresetPatchFlow(
 
 /**
  * Load a live sky patch at `(ra, dec, fovArcmin)` using a two-stage progressive
- * pipeline: Stage A fetches `/api/v1/catalogs` concurrently with Stage B
- * `/api/v1/sky-patch`, then fetches all epoch frames in parallel with `?precision=float16`.
- *
- * @param ra - Right Ascension in decimal degrees `[0, 360)`.
- * @param dec - Declination in decimal degrees `[-90, 90]`.
- * @param fovArcmin - Field-of-view width in arcminutes.
- * @param options - Cache instance, abort signal, and Stage A / Stage B callbacks.
- * @returns Outcome indicating whether the flow was aborted or served from cache.
- * @throws {Error} When `/api/v1/sky-patch` or any epoch binary frame fails to load.
+ * pipeline and adaptive `float32`/`float16` precision selection.
  */
 export async function loadLiveCoordinatesFlow(
   ra: number,
@@ -370,6 +509,10 @@ export async function loadLiveCoordinatesFlow(
     cache,
     fetchImpl = fetch,
     signal,
+    qualityMode = 'auto',
+    networkTracker = defaultNetworkQualityTracker,
+    bypassClientCache = false,
+    stallTimeoutMs = AUTO_FLOAT32_STALL_MS,
     onStageChange,
     onCatalogsReady,
     onReady,
@@ -379,13 +522,23 @@ export async function loadLiveCoordinatesFlow(
   const patchTimeoutMs = timeouts?.patchMs ?? SKY_PATCH_FETCH_TIMEOUT_MS;
   const frameTimeoutMs = timeouts?.frameMs ?? FRAME_FETCH_TIMEOUT_MS;
   const gridKey = computeGridKey(ra, dec, fovArcmin);
+  const targetDtype = networkTracker.resolveTargetDtype(qualityMode);
 
-  const cacheOutcome = await tryServeCachedPatch(cache, gridKey, signal, onReady);
-  if (cacheOutcome) {
-    if (!cacheOutcome.aborted) {
-      observatoryLogger.info('patch_loader', 'Live patch cache hit', { gridKey });
+  if (!bypassClientCache) {
+    const candidateKeys =
+      targetDtype === 'float16'
+        ? [livePatchCacheKey(gridKey, 'float32'), livePatchCacheKey(gridKey, 'float16'), gridKey]
+        : [livePatchCacheKey(gridKey, 'float32'), gridKey];
+    const cacheOutcome = await tryServeCachedPatch(cache, candidateKeys, signal, onReady);
+    if (cacheOutcome) {
+      if (!cacheOutcome.aborted) {
+        observatoryLogger.info('patch_loader', 'Live patch cache hit', {
+          gridKey,
+          dtype: cacheOutcome.loadedDtype,
+        });
+      }
+      return cacheOutcome;
     }
-    return cacheOutcome;
   }
 
   observatoryLogger.info('patch_loader', 'Fetching live sky patch & catalogs', {
@@ -438,12 +591,16 @@ export async function loadLiveCoordinatesFlow(
 
   return fetchAndCachePatchBundle({
     cache,
-    cacheKey: gridKey,
+    cacheKey: livePatchCacheKey(gridKey, targetDtype),
+    liveGridKey: gridKey,
     manifest: loadedManifest,
     fetchImpl,
     signal,
-    preferFloat16: true,
-    defaultDtype: 'float16',
+    targetDtype,
+    appendPrecisionQuery: true,
+    autoFallbackToFloat16: qualityMode === 'auto',
+    stallTimeoutMs,
+    networkTracker,
     prefetchSpectrum: false,
     frameTimeoutMs,
     onReady,

@@ -51,6 +51,23 @@ export const NotificationOverlay: React.FC = () => {
                 {latestAlert.detail && (
                   <div className="warning-banner-detail">{latestAlert.detail}</div>
                 )}
+                {latestAlert.actions && latestAlert.actions.length > 0 && (
+                  <div className="warning-banner-cta-row">
+                    {latestAlert.actions.map((action) => (
+                      <button
+                        key={action.label}
+                        type="button"
+                        className="hud-btn-secondary warning-banner-cta-btn"
+                        onClick={() => {
+                          action.onClick();
+                          dismissWarning(latestAlert.id);
+                        }}
+                      >
+                        {action.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
 
               <div className="warning-banner-actions">

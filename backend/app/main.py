@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -24,18 +25,71 @@ _HTTP_CLIENT_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 _HTTP_CLIENT_LIMITS = httpx.Limits(max_connections=32, max_keepalive_connections=16)
 
 
+_SINGLE_IP_PROXY_HEADERS = (
+    "fly-client-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "x-real-ip",
+)
+
+
+def _normalize_ip(raw: str) -> str | None:
+    """Parse and normalize a candidate IPv4/IPv6 string (stripping quotes/ports)."""
+    candidate = raw.strip().strip('"').strip("'")
+    if not candidate:
+        return None
+    if candidate.startswith("["):
+        end_bracket = candidate.find("]")
+        if end_bracket == -1:
+            return None
+        candidate = candidate[1:end_bracket]
+    elif candidate.count(":") == 1 and "." in candidate:
+        # IPv4:port
+        candidate = candidate.rsplit(":", 1)[0]
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def _extract_forwarded_for(header_value: str) -> str | None:
+    """Extract the leftmost valid client IP from an RFC 7239 Forwarded header."""
+    for entry in header_value.split(","):
+        for param in entry.split(";"):
+            name, sep, value = param.strip().partition("=")
+            if sep and name.strip().lower() == "for":
+                ip = _normalize_ip(value)
+                if ip is not None:
+                    return ip
+    return None
+
+
 def _extract_client_ip(request: Request) -> str:
-    """Resolve originating client IP behind Fly.io / reverse-proxy headers."""
-    fly_ip = request.headers.get("fly-client-ip")
-    if fly_ip and fly_ip.strip():
-        return fly_ip.strip()
-    forwarded = request.headers.get("x-forwarded-for")
+    """Resolve originating client IP across standard reverse-proxy and platform headers."""
+    for header_name in _SINGLE_IP_PROXY_HEADERS:
+        raw_value = request.headers.get(header_name)
+        if raw_value:
+            ip = _normalize_ip(raw_value)
+            if ip is not None:
+                return ip
+
+    forwarded = request.headers.get("forwarded")
     if forwarded:
-        first = forwarded.split(",", 1)[0].strip()
-        if first:
-            return first
+        ip = _extract_forwarded_for(forwarded)
+        if ip is not None:
+            return ip
+
+    x_forwarded_for = request.headers.get("x-forwarded-for")
+    if x_forwarded_for:
+        for part in x_forwarded_for.split(","):
+            ip = _normalize_ip(part)
+            if ip is not None:
+                return ip
+
     if request.client and request.client.host:
-        return request.client.host
+        host = request.client.host.strip()
+        if host:
+            return _normalize_ip(host) or host
     return "unknown"
 
 

@@ -15,6 +15,23 @@ export type MissionName =
 /** Wire encoding precision for binary 6-detector cutout frames. */
 export type BinaryDtype = 'float32' | 'float16';
 
+/** User-configurable fetch quality mode for sky patch binary downloads. */
+export type FetchQualityMode = 'auto' | 'full' | 'compressed';
+
+/** Metadata persisted for a recently opened Blinker sky patch. */
+export interface RecentPatchEntry {
+  id: string;
+  kind: 'preset' | 'live';
+  slug?: string | null;
+  ra: number;
+  dec: number;
+  fovArcmin: number;
+  title: string;
+  coordsLabel: string;
+  mission?: string;
+  openedAt: number;
+}
+
 /** Multi-epoch pixel comparison mode in the Blinker viewport. */
 export type ComparisonMode = 'blink' | 'subtract' | 'coadd';
 
@@ -547,4 +564,13 @@ export interface SkyExplorerContextValue {
   closeSpectraModal?: () => void;
   untrackObjectById?: (objectId: string) => void;
   requestGlobeFocus?: (ra: number, dec: number, fovDeg?: number) => void;
+  fetchQualityMode?: FetchQualityMode;
+  setFetchQualityMode?: (mode: FetchQualityMode) => void;
+  activePatchDtype?: BinaryDtype;
+  isNetworkSlow?: boolean;
+  measuredBandwidthMbps?: number | null;
+  refetchActivePatch?: () => void;
+  stepAdjacentPatch?: (direction: 'north' | 'south' | 'east' | 'west') => void;
+  recentPatches?: ReadonlyArray<RecentPatchEntry>;
+  clearRecentPatches?: () => void;
 }

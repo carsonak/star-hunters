@@ -12,7 +12,6 @@ import re
 import tempfile
 import time
 import unittest
-import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -24,8 +23,6 @@ from fastapi.testclient import TestClient
 from app.main import CachedStaticFiles, create_app
 from app.models.contracts import (
     BINARY_DETECTOR_FLOAT16_BYTES,
-    BINARY_DETECTOR_FLOAT32_BYTES,
-    BINARY_FLAGS_UINT8_BYTES,
     SHOWCASE_TARGETS,
     TRACKING_SQUARE_COLORS,
     convert_float32_bytes_to_float16_bytes,
@@ -227,8 +224,8 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
                     json.dumps(manifest),
                     json.dumps(stored_catalogs),
                     1024,
-                    0.0,
-                    0.0,
+                    time.time(),
+                    time.time(),
                 ),
             )
         legacy_manifest = self.cache.get_manifest(legacy_grid_key)
@@ -759,7 +756,7 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
         self.assertEqual(compute_max_concurrent_coadds(12), 8)
         self.assertEqual(compute_max_concurrent_coadds(16), 11)
 
-    def test_wire_ready_sqlite_encoding_and_legacy_zlib_fallback(self) -> None:
+    def test_dual_precision_sqlite_encoding_and_zero_recompression(self) -> None:
         meta = SHOWCASE_TARGETS["wise_0855"]
         manifest = build_sky_patch_manifest_payload(
             ra=meta["ra"], dec=meta["dec"], fov_arcmin=5.0, slug="wise_0855"
@@ -770,32 +767,80 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
 
         with self.cache.connection() as conn:
             rows = conn.execute(
-                "SELECT filename, encoding, compressed_blob FROM binary_frames WHERE grid_key = ?",
+                "SELECT filename, encoding FROM binary_frames WHERE grid_key = ?",
                 (grid_key,),
             ).fetchall()
-        enc_by_name = {str(r["filename"]): str(r["encoding"]) for r in rows}
-        self.assertEqual(enc_by_name["pass_1.bin"], "gzip_float16")
-        self.assertEqual(enc_by_name["pass_1_flags.bin"], "gzip_uint8")
+        encodings_by_name: dict[str, set[str]] = {}
+        for r in rows:
+            encodings_by_name.setdefault(str(r["filename"]), set()).add(str(r["encoding"]))
+        self.assertEqual(encodings_by_name["pass_1.bin"], {"gzip_float32", "gzip_float16"})
+        self.assertEqual(encodings_by_name["pass_1_flags.bin"], {"gzip_uint8"})
 
         raw32 = self.cache.get_frame(grid_key, "pass_1.bin")
         assert raw32 is not None
-        self.assertEqual(len(raw32), BINARY_DETECTOR_FLOAT32_BYTES)
+        self.assertEqual(raw32, frames["pass_1.bin"])
         flags_raw = self.cache.get_frame(grid_key, "pass_1_flags.bin")
         assert flags_raw is not None
-        self.assertEqual(len(flags_raw), BINARY_FLAGS_UINT8_BYTES)
+        self.assertEqual(flags_raw, frames["pass_1_flags.bin"])
 
-        # Simulate a legacy zlib_raw row on disk and verify backwards-compatible decoding
-        with self.cache.connection() as conn:
-            conn.execute(
-                "UPDATE binary_frames SET compressed_blob = ?, encoding = 'zlib_raw' "
-                "WHERE grid_key = ? AND filename = ?",
-                (zlib.compress(frames["pass_2.bin"], level=1), grid_key, "pass_2.bin"),
-            )
         self.cache._mem_cache.clear()
-        legacy_gz = self.cache.get_frame_gzip(grid_key, "pass_2.bin", precision="float16")
-        assert legacy_gz is not None
-        self.assertEqual(legacy_gz[1], "float16")
-        self.assertEqual(len(gzip.decompress(legacy_gz[0])), BINARY_DETECTOR_FLOAT16_BYTES)
+        with (
+            patch("app.services.spatial_cache.gzip.compress") as mock_gz,
+            patch("app.services.spatial_cache.convert_float32_bytes_to_float16_bytes") as mock_f16,
+        ):
+            gz32 = self.cache.get_frame_gzip(grid_key, "pass_1.bin", precision="float32")
+            gz16 = self.cache.get_frame_gzip(grid_key, "pass_1.bin", precision="float16")
+            self.assertEqual(mock_gz.call_count, 0)
+            self.assertEqual(mock_f16.call_count, 0)
+
+        assert gz32 is not None and gz16 is not None
+        self.assertEqual(gz32[1], "float32")
+        self.assertEqual(gzip.decompress(gz32[0]), frames["pass_1.bin"])
+        self.assertEqual(gz16[1], "float16")
+        self.assertEqual(len(gzip.decompress(gz16[0])), BINARY_DETECTOR_FLOAT16_BYTES)
+
+    def test_sky_patch_and_spectrum_7day_ttl_and_stale_if_error(self) -> None:
+        from app.services.spatial_cache import SpatialSqliteCache
+
+        ttl_cache = SpatialSqliteCache(
+            db_path=str(self.tmp_path / "ttl_cache.db"),
+            patch_ttl_seconds=60.0,
+        )
+        try:
+            meta = SHOWCASE_TARGETS["wise_0855"]
+            manifest = build_sky_patch_manifest_payload(
+                ra=meta["ra"], dec=meta["dec"], fov_arcmin=5.0, slug="wise_0855"
+            )
+            manifest["data_source_summary"]["provenance_tier"] = "primary"
+            manifest["data_source_summary"]["status_note"] = "SPHEREx QR2 archival passes"
+            frames = generate_synthetic_epoch_frames(slug="wise_0855", manifest=manifest)
+            grid_key, ra_q, dec_q = compute_grid_key(meta["ra"], meta["dec"], 5.0)
+            ttl_cache.put_sky_patch(grid_key, ra_q, dec_q, 5.0, manifest, frames)
+
+            self.assertIsNotNone(ttl_cache.get_manifest(grid_key))
+            # Age created_at past the 60s TTL
+            with ttl_cache.connection() as conn:
+                conn.execute(
+                    "UPDATE sky_patches SET created_at = ? WHERE grid_key = ?",
+                    (time.time() - 120.0, grid_key),
+                )
+            ttl_cache._mem_cache.clear()
+            self.assertIsNone(ttl_cache.get_manifest(grid_key, allow_stale=False))
+            stale = ttl_cache.get_manifest(grid_key, allow_stale=True)
+            assert stale is not None
+            self.assertEqual(stale["data_source_summary"]["provenance_tier"], "primary")
+
+            # Stale-if-error in StarHuntersBackendService when upstream degrades to simulated
+            svc = StarHuntersBackendService(cache=ttl_cache, enable_archival_data=True)
+            with patch.object(
+                svc.archival_resolver,
+                "resolve_archival_patch_sync",
+                side_effect=RuntimeError("IRSA unreachable"),
+            ):
+                served = svc.get_sky_patch(meta["ra"], meta["dec"], 5.0)
+                self.assertEqual(served["data_source_summary"]["provenance_tier"], "primary")
+        finally:
+            ttl_cache.close()
 
     def test_cpu_and_io_executor_isolation(self) -> None:
         async def _verify_isolation() -> None:
@@ -897,10 +942,66 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
         )
         self.assertEqual(r5_other_ip.status_code, 200)
 
+    def test_extract_client_ip_supports_agnostic_proxy_headers(self) -> None:
+        from starlette.requests import Request
+
+        from app.main import _extract_client_ip
+
+        def make_request(
+            headers: dict[str, str] | None = None,
+            client: tuple[str, int] | None = ("127.0.0.1", 12345),
+        ) -> Request:
+            raw_headers = [
+                (k.lower().encode("latin-1"), v.encode("latin-1"))
+                for k, v in (headers or {}).items()
+            ]
+            scope = {
+                "type": "http",
+                "method": "GET",
+                "path": "/",
+                "headers": raw_headers,
+                "client": client,
+            }
+            return Request(scope)
+
+        self.assertEqual(
+            _extract_client_ip(make_request({"CF-Connecting-IP": "198.51.100.7"})),
+            "198.51.100.7",
+        )
+        self.assertEqual(
+            _extract_client_ip(make_request({"X-Real-IP": "198.51.100.8:443"})),
+            "198.51.100.8",
+        )
+        self.assertEqual(
+            _extract_client_ip(
+                make_request({"Forwarded": 'for="[2001:db8:cafe::17]:4711";proto=https'})
+            ),
+            "2001:db8:cafe::17",
+        )
+        self.assertEqual(
+            _extract_client_ip(
+                make_request({"X-Forwarded-For": "not-an-ip, 203.0.113.42, 10.0.0.1"})
+            ),
+            "203.0.113.42",
+        )
+        self.assertEqual(
+            _extract_client_ip(make_request(client=("192.0.2.5", 5000))),
+            "192.0.2.5",
+        )
+        self.assertEqual(
+            _extract_client_ip(make_request(client=None)),
+            "unknown",
+        )
+
     def test_sqlite_schema_user_version_and_last_accessed_index(self) -> None:
+        from app.services.spatial_cache import SCHEMA_VERSION
+
         with self.cache.connection() as conn:
             ver = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            self.assertEqual(ver, 3)
+            self.assertEqual(ver, SCHEMA_VERSION)
+            cols = {
+                str(r["name"]) for r in conn.execute("PRAGMA table_info(binary_frames)").fetchall()
+            }
             patch_idx = {
                 str(r["name"]) for r in conn.execute("PRAGMA index_list(sky_patches)").fetchall()
             }
@@ -908,48 +1009,9 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
                 str(r["name"])
                 for r in conn.execute("PRAGMA index_list(catalog_region_cache)").fetchall()
             }
+        self.assertIn("encoding", cols)
         self.assertIn("idx_sky_patches_last_accessed", patch_idx)
         self.assertIn("idx_catalog_region_last_accessed", cat_idx)
-
-        # Simulate upgrading an older v0 SQLite DB without encoding column or new indices
-        import sqlite3
-
-        legacy_db = str(self.tmp_path / "legacy_v0.db")
-        raw_conn = sqlite3.connect(legacy_db)
-        raw_conn.executescript(
-            """
-            CREATE TABLE sky_patches (
-                grid_key TEXT PRIMARY KEY, ra_center REAL NOT NULL,
-                dec_center REAL NOT NULL, fov_arcmin REAL NOT NULL,
-                manifest_json TEXT NOT NULL, catalogs_json TEXT NOT NULL,
-                byte_size INTEGER NOT NULL, created_at REAL NOT NULL, last_accessed REAL NOT NULL
-            );
-            CREATE TABLE binary_frames (
-                grid_key TEXT NOT NULL, filename TEXT NOT NULL,
-                compressed_blob BLOB NOT NULL, raw_byte_size INTEGER NOT NULL,
-                PRIMARY KEY (grid_key, filename)
-            );
-            PRAGMA user_version = 0;
-            """
-        )
-        raw_conn.close()
-
-        migrated = SpatialSqliteCache(db_path=legacy_db)
-        try:
-            with migrated.connection() as conn:
-                self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 3)
-                cols = {
-                    str(r["name"])
-                    for r in conn.execute("PRAGMA table_info(binary_frames)").fetchall()
-                }
-                self.assertIn("encoding", cols)
-                migrated_idx = {
-                    str(r["name"])
-                    for r in conn.execute("PRAGMA index_list(sky_patches)").fetchall()
-                }
-                self.assertIn("idx_sky_patches_last_accessed", migrated_idx)
-        finally:
-            migrated.close()
 
     def test_memory_lru_o1_tag_invalidation(self) -> None:
         gk1 = "ra10.00_dec20.00_fov5.0"

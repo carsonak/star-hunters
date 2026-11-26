@@ -1,14 +1,16 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { NotificationContextValue } from '../context/NotificationContext';
-import { defaultClientPatchCache } from '../services/clientPatchCache';
+import { defaultClientPatchCache, livePatchCacheKey } from '../services/clientPatchCache';
 import {
   loadLiveCoordinatesFlow,
   loadPresetPatchFlow,
   type LoadedPatchResult,
 } from '../services/progressivePatchLoader';
 import type {
+  BinaryDtype,
   CatalogsResponse,
+  FetchQualityMode,
   KnownCelestialObject,
   SkyExplorerContextValue,
   SkyPatchManifest,
@@ -17,7 +19,14 @@ import {
   assignDeterministicHighlighterColors,
   getDefaultCheckedObjectIds,
 } from '../utils/knownObjectSelection';
+import {
+  defaultNetworkQualityTracker,
+  FAST_NETWORK_RECOVERY_MBPS,
+  readStoredQualityMode,
+  saveQualityMode,
+} from '../utils/networkQuality';
 import { observatoryLogger } from '../utils/observatoryLogger';
+import { computeGridKey } from '../utils/wcsViewport';
 
 /** Callbacks supplied to {@link usePatchLoader} to coordinate dependent context slices. */
 export interface UsePatchLoaderOptions {
@@ -64,6 +73,21 @@ export function usePatchLoader({
   const [objectHighlighterColors, setObjectHighlighterColors] = useState<Record<string, string>>(
     {},
   );
+  const [fetchQualityMode, setFetchQualityModeState] = useState<FetchQualityMode>(() =>
+    readStoredQualityMode(),
+  );
+  const [activePatchDtype, setActivePatchDtype] = useState<BinaryDtype>('float32');
+  const [networkSnapshot, setNetworkSnapshot] = useState(() =>
+    defaultNetworkQualityTracker.getSnapshot(),
+  );
+
+  const fetchQualityModeRef = useRef<FetchQualityMode>(fetchQualityMode);
+  const sessionRecommendedRef = useRef<Set<'compressed-good' | 'full-bad'>>(new Set());
+  const setFetchQualityMode = useCallback((nextMode: FetchQualityMode) => {
+    fetchQualityModeRef.current = nextMode;
+    setFetchQualityModeState(nextMode);
+    saveQualityMode(nextMode);
+  }, []);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const lastLoadRequestRef = useRef<
@@ -113,15 +137,65 @@ export function usePatchLoader({
 
       callbacksRef.current.onStageBReady(result, getDefaultCheckedObjectIds(nextKnownObjects));
       setLoadingState({ stage: 'ready', fromClientCache: result.fromClientCache });
+      const actualDtype: BinaryDtype = result.loadedDtype ?? 'float32';
+      setActivePatchDtype(actualDtype);
+      const snap = defaultNetworkQualityTracker.getSnapshot();
+      setNetworkSnapshot(snap);
       notificationsRef.current?.finishAsyncTask('sky-patch-load');
+
+      const mode = fetchQualityModeRef.current;
+      if (
+        mode === 'auto' &&
+        actualDtype === 'float16' &&
+        (!result.fromClientCache || result.degradedOnAutoFallback)
+      ) {
+        notificationsRef.current?.pushWarning({
+          id: 'quality-auto-degraded',
+          title: 'Reduced image quality (Compressed) due to slow connection',
+          detail: 'Switch to Full or click Refetch in Blinker once your connection improves.',
+          level: 'warning',
+        });
+      } else if (
+        mode === 'compressed' &&
+        !snap.isSlow &&
+        snap.measuredMbps !== null &&
+        snap.measuredMbps >= FAST_NETWORK_RECOVERY_MBPS &&
+        !sessionRecommendedRef.current.has('compressed-good')
+      ) {
+        sessionRecommendedRef.current.add('compressed-good');
+        notificationsRef.current?.pushWarning({
+          id: 'quality-recommend-upgrade',
+          title: `Fast connection detected (${snap.measuredMbps.toFixed(1)} Mbps)`,
+          detail: 'Switch from Compressed to Auto or Full for full scientific precision.',
+          level: 'warning',
+          actions: [
+            { label: 'Switch to Auto', onClick: () => setFetchQualityMode('auto') },
+            { label: 'Switch to Full', onClick: () => setFetchQualityMode('full') },
+          ],
+        });
+      } else if (mode === 'full' && snap.isSlow && !sessionRecommendedRef.current.has('full-bad')) {
+        sessionRecommendedRef.current.add('full-bad');
+        notificationsRef.current?.pushWarning({
+          id: 'quality-recommend-downgrade',
+          title: `Slow connection detected${snap.measuredMbps ? ` (${snap.measuredMbps.toFixed(1)} Mbps)` : ''}`,
+          detail: 'Switch from Full to Auto or Compressed to improve load times.',
+          level: 'warning',
+          actions: [
+            { label: 'Switch to Auto', onClick: () => setFetchQualityMode('auto') },
+            { label: 'Switch to Compressed', onClick: () => setFetchQualityMode('compressed') },
+          ],
+        });
+      }
+
       observatoryLogger.info('patch', 'Sky patch ready for blinking', {
         gridKey: result.manifest.query.grid_key,
         mission: result.manifest.data_source_summary?.primary_mission,
         epochs: result.manifest.epochs.length,
         fromClientCache: result.fromClientCache,
+        dtype: actualDtype,
       });
     },
-    [notificationsRef],
+    [notificationsRef, setFetchQualityMode],
   );
 
   const runPatchLoad = useCallback(
@@ -170,7 +244,7 @@ export function usePatchLoader({
   );
 
   const loadPresetBundle = useCallback(
-    async (slug: string) => {
+    async (slug: string, bypassClientCache = false) => {
       lastLoadRequestRef.current = { kind: 'preset', slug };
       await runPatchLoad({
         taskMessage: 'Loading target frames...',
@@ -184,6 +258,7 @@ export function usePatchLoader({
           await loadPresetPatchFlow(slug, {
             cache: defaultClientPatchCache,
             signal,
+            bypassClientCache,
             onStageChange: setLoadingState,
             onReady: (result) => applyLoadedPatch(result, true, false),
           });
@@ -194,7 +269,7 @@ export function usePatchLoader({
   );
 
   const loadLiveCoordinates = useCallback(
-    async (ra: number, dec: number, fovArcmin: number) => {
+    async (ra: number, dec: number, fovArcmin: number, bypassClientCache = false) => {
       lastLoadRequestRef.current = { kind: 'live', ra, dec, fovArcmin };
       await runPatchLoad({
         taskMessage: 'Streaming epoch frames...',
@@ -213,6 +288,9 @@ export function usePatchLoader({
           await loadLiveCoordinatesFlow(ra, dec, fovArcmin, {
             cache: defaultClientPatchCache,
             signal,
+            qualityMode: fetchQualityModeRef.current,
+            networkTracker: defaultNetworkQualityTracker,
+            bypassClientCache,
             onStageChange: setLoadingState,
             onCatalogsReady: (catData: CatalogsResponse) => {
               const stageAObjects = catData.catalog_overlays.known_objects ?? [];
@@ -257,6 +335,24 @@ export function usePatchLoader({
     }
   }, [loadLiveCoordinates, loadPresetBundle]);
 
+  const refetchActivePatch = useCallback(() => {
+    const req = lastLoadRequestRef.current;
+    if (req.kind === 'preset') {
+      void defaultClientPatchCache.deletePatch(`preset:${req.slug}`).finally(() => {
+        void loadPresetBundle(req.slug, true);
+      });
+    } else {
+      const gk = computeGridKey(req.ra, req.dec, req.fovArcmin);
+      void Promise.all([
+        defaultClientPatchCache.deletePatch(livePatchCacheKey(gk, 'float32')),
+        defaultClientPatchCache.deletePatch(livePatchCacheKey(gk, 'float16')),
+        defaultClientPatchCache.deletePatch(gk),
+      ]).finally(() => {
+        void loadLiveCoordinates(req.ra, req.dec, req.fovArcmin, true);
+      });
+    }
+  }, [loadLiveCoordinates, loadPresetBundle]);
+
   return {
     activePresetSlug,
     setActivePresetSlug,
@@ -268,8 +364,14 @@ export function usePatchLoader({
     loadingState,
     knownObjects,
     objectHighlighterColors,
+    fetchQualityMode,
+    setFetchQualityMode,
+    activePatchDtype,
+    isNetworkSlow: networkSnapshot.isSlow,
+    measuredBandwidthMbps: networkSnapshot.measuredMbps,
     loadPresetBundle,
     loadLiveCoordinates,
     retryActivePatch,
+    refetchActivePatch,
   };
 }

@@ -71,6 +71,7 @@ export function useResizableSplit(options: UseResizableSplitOptions = {}) {
   const [splitRatio, setSplitRatio] = useState<number>(() =>
     readStoredNumber(splitRatioStorageKey, defaultSplitRatio, minSplitRatio, maxSplitRatio),
   );
+  const [recentsFolded, setRecentsFolded] = useState<boolean>(true);
   const [controlsFolded, setControlsFolded] = useState<boolean>(false);
   const [objectsFolded, setObjectsFolded] = useState<boolean>(false);
   const dragCleanupRef = useRef<(() => void) | null>(null);
@@ -89,6 +90,7 @@ export function useResizableSplit(options: UseResizableSplitOptions = {}) {
     });
   }, [collapsedStorageKey]);
 
+  const toggleRecentsFold = useCallback(() => setRecentsFolded((prev) => !prev), []);
   const toggleControlsFold = useCallback(() => setControlsFolded((prev) => !prev), []);
   const toggleObjectsFold = useCallback(() => setObjectsFolded((prev) => !prev), []);
 
@@ -172,9 +174,11 @@ export function useResizableSplit(options: UseResizableSplitOptions = {}) {
     sidebarCollapsed,
     sidebarWidth,
     splitRatio,
+    recentsFolded,
     controlsFolded,
     objectsFolded,
     toggleSidebarCollapsed,
+    toggleRecentsFold,
     toggleControlsFold,
     toggleObjectsFold,
     startSidebarWidthResize,

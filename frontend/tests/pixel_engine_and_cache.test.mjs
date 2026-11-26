@@ -21,6 +21,16 @@ test('Wavelength Dim & Pop detector weights isolate cold IR detectors (3.8 - 5.0
   assert.ok(Math.abs(coldWeights[2] - 0.05) < 1e-6);
   assert.ok(Math.abs(coldWeights[4] - 1.0) < 1e-6);
   assert.ok(Math.abs(coldWeights[5] - 1.0) < 1e-6);
+
+  // SkyView optical/NIR range [0.65, 0.85] preserves Detectors 1–2 at full brightness
+  const skyViewFullWeights = computeDetectorWeights([0.65, 0.85]);
+  assert.ok(Math.abs(skyViewFullWeights[0] - 1.0) < 1e-6);
+  assert.ok(Math.abs(skyViewFullWeights[1] - 1.0) < 1e-6);
+  assert.ok(Math.abs(skyViewFullWeights[2] - 0.05) < 1e-6);
+
+  // Sub-band SkyView slice [0.65, 0.75] scales Detectors 1–2 smoothly without blacking out
+  const skyViewRedWeights = computeDetectorWeights([0.65, 0.75]);
+  assert.ok(skyViewRedWeights[0] > 0.5 && skyViewRedWeights[0] < 0.55);
 });
 
 test('ISS-11: subtracting an epoch from itself produces a uniform neutral background', () => {

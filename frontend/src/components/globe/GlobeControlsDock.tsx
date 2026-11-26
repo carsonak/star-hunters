@@ -1,23 +1,30 @@
 import React from 'react';
+import type { FetchQualityMode } from '../../types/contracts';
 import { SUPPORTED_GLOBE_PROJECTIONS, type GlobeProjection } from '../../utils/globeNavigation';
 
 interface GlobeControlsDockProps {
   showConstellations: boolean;
   projection: GlobeProjection;
+  fetchQualityMode: FetchQualityMode;
   onPan: (dir: 'north' | 'south' | 'east' | 'west') => void;
   onZoom: (factor: number | 'reset') => void;
   onToggleConstellations: () => void;
   onChangeProjection: (nextProj: GlobeProjection) => void;
+  onChangeQualityMode: (nextMode: FetchQualityMode) => void;
+  onOpenCenterPatch: () => void;
 }
 
-/** Accessible pan/zoom cross, constellation toggle, and Aladin projection selector dock. */
+/** Accessible pan/zoom cross, constellation toggle, projection, quality, and center-patch launcher. */
 export const GlobeControlsDock: React.FC<GlobeControlsDockProps> = ({
   showConstellations,
   projection,
+  fetchQualityMode,
   onPan,
   onZoom,
   onToggleConstellations,
   onChangeProjection,
+  onChangeQualityMode,
+  onOpenCenterPatch,
 }) => (
   <div
     className="globe-controls-dock"
@@ -135,5 +142,32 @@ export const GlobeControlsDock: React.FC<GlobeControlsDockProps> = ({
         </option>
       ))}
     </select>
+
+    <span className="globe-telemetry-divider" style={{ height: 24 }} />
+
+    <select
+      aria-label="Patch Fetch Quality"
+      data-testid="globe-quality-select"
+      className="globe-nav-btn"
+      style={{ paddingRight: 6 }}
+      title="Frame download quality (Auto switches to Compressed below 3 Mbps)"
+      value={fetchQualityMode}
+      onChange={(e) => onChangeQualityMode(e.target.value as FetchQualityMode)}
+    >
+      <option value="auto">Quality: Auto</option>
+      <option value="full">Quality: Full</option>
+      <option value="compressed">Quality: Compressed</option>
+    </select>
+
+    <button
+      type="button"
+      className="hud-btn-primary"
+      data-testid="globe-open-center-patch"
+      title="Open Blinker detailed view for the sky patch at the center of the viewport"
+      style={{ height: 28, padding: '0 10px', fontSize: 11.5 }}
+      onClick={onOpenCenterPatch}
+    >
+      Open Detailed View
+    </button>
   </div>
 );

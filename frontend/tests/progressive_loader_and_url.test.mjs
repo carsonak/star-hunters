@@ -205,6 +205,7 @@ test('ISS-21: Stage A catalogs populate knownObjects before Stage B cutouts comp
   const flowPromise = loadLiveCoordinatesFlow(133.8, -7.25, 5.0, {
     cache,
     fetchImpl: mockFetch,
+    qualityMode: 'compressed',
     onStageChange: (st) => timeline.push(`stage:${st.stage}`),
     onCatalogsReady: (cat) => {
       timeline.push(`catalogs:${cat.catalog_overlays.known_objects.length}`);
@@ -240,6 +241,7 @@ test('ISS-21: Stage A catalogs populate knownObjects before Stage B cutouts comp
   const cachedOutcome = await loadLiveCoordinatesFlow(133.8, -7.25, 5.0, {
     cache,
     fetchImpl: mockFetch,
+    qualityMode: 'compressed',
     onReady: (res) => {
       cachedReady = res;
     },

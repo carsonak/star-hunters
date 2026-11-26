@@ -2,7 +2,8 @@ import React, { useMemo } from 'react';
 import type { ComparisonMode, MissionName, ViewportRenderSettings } from '../../types/contracts';
 import {
   isWavelengthPresetActive,
-  WAVELENGTH_PRESETS,
+  isWavelengthPresetEnabled,
+  resolveWavelengthConfigForMissions,
   type MissionSourceCount,
 } from '../../utils/knownObjectSelection';
 import { DualThumbRangeSlider } from '../DualThumbRangeSlider';
@@ -28,6 +29,8 @@ export interface BlinkerControlsSectionProps {
   availableMissions: ReadonlyArray<MissionSourceCount>;
   /** Currently enabled mission filters. */
   activeMissions: ReadonlyArray<MissionName>;
+  /** Primary mission reported by the patch manifest (`data_source_summary.primary_mission`). */
+  primaryMission?: MissionName;
   /** Optional handler to toggle a mission filter pill. */
   toggleMissionFilter?: (mission: MissionName) => void;
 }
@@ -56,11 +59,16 @@ export const BlinkerControlsSection: React.FC<BlinkerControlsSectionProps> = ({
   allowedEpochIndices,
   availableMissions,
   activeMissions,
+  primaryMission,
   toggleMissionFilter,
 }) => {
   const onlyOneMissionActive = useMemo(
     () => availableMissions.filter((m) => activeMissions.includes(m.mission)).length <= 1,
     [activeMissions, availableMissions],
+  );
+  const wavelengthConfig = useMemo(
+    () => resolveWavelengthConfigForMissions(availableMissions, activeMissions, primaryMission),
+    [activeMissions, availableMissions, primaryMission],
   );
 
   const passPosA = Math.max(0, allowedEpochIndices.indexOf(renderSettings.passAIndex));
@@ -90,10 +98,12 @@ export const BlinkerControlsSection: React.FC<BlinkerControlsSectionProps> = ({
             <DualThumbRangeSlider
               label="Wavelength Slice"
               variant="spectrum"
-              min={0.75}
-              max={5.0}
-              step={0.05}
-              minGap={0.15}
+              min={wavelengthConfig.railMin}
+              max={wavelengthConfig.railMax}
+              allowedMin={wavelengthConfig.min}
+              allowedMax={wavelengthConfig.max}
+              step={wavelengthConfig.step}
+              minGap={wavelengthConfig.minGap}
               value={renderSettings.wavelengthRangeUm}
               formatReadout={(lo, hi) => `${lo.toFixed(2)}-${hi.toFixed(2)} µm`}
               lowAriaLabel="Minimum wavelength micrometers"
@@ -102,16 +112,21 @@ export const BlinkerControlsSection: React.FC<BlinkerControlsSectionProps> = ({
               onChange={(next) => updateRenderSettings({ wavelengthRangeUm: next })}
             />
             <div className="blinker-preset-row">
-              {WAVELENGTH_PRESETS.map((preset) => {
-                const isActive = isWavelengthPresetActive(
-                  renderSettings.wavelengthRangeUm,
-                  preset.range,
-                );
+              {wavelengthConfig.presets.map((preset) => {
+                const isEnabled = isWavelengthPresetEnabled(preset.range, wavelengthConfig);
+                const isActive =
+                  isEnabled &&
+                  isWavelengthPresetActive(renderSettings.wavelengthRangeUm, preset.range);
                 return (
                   <button
                     key={preset.id}
                     type="button"
-                    title={preset.label}
+                    disabled={!isEnabled}
+                    title={
+                      isEnabled
+                        ? preset.label
+                        : `${preset.label} — outside active mission range (${wavelengthConfig.min.toFixed(2)}–${wavelengthConfig.max.toFixed(2)} µm)`
+                    }
                     aria-pressed={isActive}
                     className={`hud-btn-secondary blinker-preset-btn ${isActive ? 'is-active' : ''}`}
                     onClick={() => updateRenderSettings({ wavelengthRangeUm: preset.range })}

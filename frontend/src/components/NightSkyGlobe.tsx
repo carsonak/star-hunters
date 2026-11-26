@@ -72,6 +72,8 @@ export const NightSkyGlobe: React.FC = () => {
     objectHighlighterColors = {},
     isBlinkerModalOpen = false,
     openBlinkerModal,
+    fetchQualityMode = 'auto',
+    setFetchQualityMode,
   } = useSkyExplorer();
   const { skyFrustum, setSkyFrustum, globeFocusRequest } = useSkyFrustum();
 
@@ -775,6 +777,7 @@ export const NightSkyGlobe: React.FC = () => {
       <GlobeControlsDock
         showConstellations={showConstellations}
         projection={projection}
+        fetchQualityMode={fetchQualityMode}
         onPan={(dir) => {
           const cur = viewStateRef.current;
           const next = stepPanCoordinates(cur.ra, cur.dec, cur.fovDeg, dir);
@@ -801,6 +804,19 @@ export const NightSkyGlobe: React.FC = () => {
           setProjection(nextProj);
           aladinInstanceRef.current?.setProjection?.(nextProj);
           observatoryLogger.info('globe', 'Projection changed', { projection: nextProj });
+        }}
+        onChangeQualityMode={(nextMode) => setFetchQualityMode?.(nextMode)}
+        onOpenCenterPatch={() => {
+          const cur = viewStateRef.current;
+          const matchingPreset = BENCHMARK_TARGET_OPTIONS.find(
+            (b) => angularSeparationDeg(cur.ra, cur.dec, b.ra, b.dec) <= 0.03,
+          );
+          if (matchingPreset) {
+            openBlinkerModal?.(matchingPreset.slug);
+          } else {
+            const { raQ, decQ } = quantizeGridCenter(cur.ra, cur.dec, PANEL_GRID_STEP_DEG);
+            openBlinkerModal?.({ ra: raQ, dec: decQ, fovArcmin: SPHEREX_PATCH_ARCMIN });
+          }
         }}
       />
 

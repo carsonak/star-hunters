@@ -15,11 +15,17 @@
  * gracefully degrades to the in-memory tier instead of throwing.
  */
 
-import type { CatalogsResponse, SkyPatchManifest, SpectrumPayload } from '../types/contracts.ts';
+import type {
+  BinaryDtype,
+  CatalogsResponse,
+  SkyPatchManifest,
+  SpectrumPayload,
+} from '../types/contracts.ts';
 
 /** Cached multi-epoch binary bundle and metadata persisted per sky patch. */
 export interface CachedSkyPatchBundle {
   cacheKey: string;
+  dtype?: BinaryDtype;
   manifest: SkyPatchManifest;
   epochBuffers: Float32Array[][];
   flagsBuffers: Uint8Array[];
@@ -78,6 +84,17 @@ export function gridCacheKey(gridKey: string): string {
   return gridKey.trim();
 }
 
+/**
+ * Precision-qualified cache key so `float32` and `float16` bundles for the same
+ * sky patch are stored as distinct entries in RAM and IndexedDB.
+ */
+export function livePatchCacheKey(gridKey: string, dtype: BinaryDtype): string {
+  return `${gridKey.trim()}:${dtype}`;
+}
+
+/** Default 7-day client cache TTL matching backend IRSA weekly releases. */
+export const DEFAULT_CLIENT_PATCH_TTL_MS = 7 * 24 * 3600 * 1000;
+
 /** IndexedDB database name for persisted sky patch and catalog caches. */
 export const PATCH_CACHE_DB_NAME = 'star_hunters_patch_cache_v1';
 /** IndexedDB object store name for decoded sky patch bundles. */
@@ -99,6 +116,7 @@ export class TieredLruStore<T extends LruTimestampedEntry> {
   private misses = 0;
   private readonly storeName: string;
   private readonly maxEntries: number;
+  private readonly ttlMs: number | null;
   private readonly nextAccessStamp: () => number;
   private readonly openDb: () => Promise<IDBDatabase | null>;
 
@@ -110,11 +128,13 @@ export class TieredLruStore<T extends LruTimestampedEntry> {
   constructor(options: {
     storeName: string;
     maxEntries: number;
+    ttlMs?: number | null;
     nextAccessStamp: () => number;
     openDb: () => Promise<IDBDatabase | null>;
   }) {
     this.storeName = options.storeName;
     this.maxEntries = options.maxEntries;
+    this.ttlMs = options.ttlMs ?? null;
     this.nextAccessStamp = options.nextAccessStamp;
     this.openDb = options.openDb;
   }
@@ -140,9 +160,26 @@ export class TieredLruStore<T extends LruTimestampedEntry> {
    * @param key - Canonical store key.
    * @returns Cached entry if present, otherwise `null`.
    */
+  private isExpired(entry: T): boolean {
+    if (
+      this.ttlMs === null ||
+      this.ttlMs <= 0 ||
+      !entry.storedAt ||
+      entry.storedAt < 1_000_000_000_000
+    ) {
+      return false;
+    }
+    return Date.now() - entry.storedAt > this.ttlMs;
+  }
+
   public async get(key: string): Promise<T | null> {
     const inMem = this.memory.get(key);
     if (inMem) {
+      if (this.isExpired(inMem)) {
+        await this.delete(key);
+        this.misses += 1;
+        return null;
+      }
       this.hits += 1;
       // Hot path: touch memory only. Re-serializing a multi-megabyte bundle to
       // IndexedDB on every read would defeat the <5 ms requirement; the
@@ -153,6 +190,11 @@ export class TieredLruStore<T extends LruTimestampedEntry> {
 
     const fromIdb = await this.readFromIndexedDb(key);
     if (fromIdb) {
+      if (this.isExpired(fromIdb)) {
+        await this.delete(key);
+        this.misses += 1;
+        return null;
+      }
       this.hits += 1;
       const stamp = this.nextAccessStamp();
       fromIdb.lastAccessed = stamp;
@@ -361,7 +403,10 @@ export class ClientPatchCache {
    *
    * @param maxEntries - Maximum number of entries retained per store.
    */
-  constructor(maxEntries: number = DEFAULT_MAX_MEMORY_PATCHES) {
+  constructor(
+    maxEntries: number = DEFAULT_MAX_MEMORY_PATCHES,
+    ttlMs: number = DEFAULT_CLIENT_PATCH_TTL_MS,
+  ) {
     this.maxEntries = Number.isFinite(maxEntries)
       ? Math.max(0, Math.floor(maxEntries))
       : DEFAULT_MAX_MEMORY_PATCHES;
@@ -372,12 +417,14 @@ export class ClientPatchCache {
     this.patchStore = new TieredLruStore<CachedSkyPatchBundle>({
       storeName: PATCH_CACHE_STORE_PATCHES,
       maxEntries: this.maxEntries,
+      ttlMs,
       nextAccessStamp,
       openDb,
     });
     this.catalogStore = new TieredLruStore<CatalogCacheEntry>({
       storeName: PATCH_CACHE_STORE_CATALOGS,
       maxEntries: this.maxEntries,
+      ttlMs,
       nextAccessStamp,
       openDb,
     });

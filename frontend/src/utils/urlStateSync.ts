@@ -73,7 +73,7 @@ export interface ReplaceUrlStateOptions {
 
 const KNOWN_PARAM_KEYS = ['target', 'ra', 'dec', 'fov', 'mode', 'wlMin', 'wlMax'] as const;
 
-const WL_MIN_LIMIT = 0.75;
+const WL_MIN_LIMIT = 0.65;
 const WL_MAX_LIMIT = 5.0;
 const FOV_MAX = 180.0;
 
