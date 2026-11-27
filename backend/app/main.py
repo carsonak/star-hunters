@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import hmac
 import ipaddress
 import math
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -161,9 +164,10 @@ def create_app(service: StarHuntersBackendService | None = None) -> FastAPI:
     fastapi_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "HEAD", "OPTIONS"],
+        allow_headers=["Accept", "Content-Type", "Authorization", "X-Cache-Delta"],
+        expose_headers=["X-Binary-Dtype"],
     )
 
     @fastapi_app.get("/health")
@@ -201,6 +205,7 @@ def create_app(service: StarHuntersBackendService | None = None) -> FastAPI:
     @fastapi_app.get("/api/v1/catalogs")
     @fastapi_app.get("/api/catalogs")
     async def get_catalogs(
+        request: Request,
         response: Response,
         ra: float = Query(..., ge=0.0, le=360.0),
         dec: float = Query(..., ge=-90.0, le=90.0),
@@ -208,6 +213,7 @@ def create_app(service: StarHuntersBackendService | None = None) -> FastAPI:
         live_catalogs: bool = Query(True),
     ) -> dict[str, Any]:
         """Return multi-catalog overlays (SIMBAD, Gaia DR3, Solar System) for a sky patch."""
+        active_service.cache.record_client_cache_delta(request.headers.get("x-cache-delta"))
         response.headers["Cache-Control"] = "public, max-age=3600"
         return await active_service.get_catalogs_async(
             ra=ra,
@@ -288,6 +294,7 @@ def create_app(service: StarHuntersBackendService | None = None) -> FastAPI:
         live_catalogs: bool = Query(True),
     ) -> dict[str, Any]:
         """Assemble or retrieve a cached multi-epoch ``SkyPatchManifest``."""
+        active_service.cache.record_client_cache_delta(request.headers.get("x-cache-delta"))
         response.headers["Cache-Control"] = "public, max-age=3600"
         try:
             return await active_service.get_sky_patch_async(
@@ -296,6 +303,7 @@ def create_app(service: StarHuntersBackendService | None = None) -> FastAPI:
                 fov=fov,
                 live_catalogs=live_catalogs,
                 client_ip=_extract_client_ip(request),
+                user_agent=request.headers.get("user-agent"),
             )
         except ColdMissRateLimitError as exc:
             raise HTTPException(
@@ -381,6 +389,26 @@ def create_app(service: StarHuntersBackendService | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=503, detail=f"SPHEREx spectrum unavailable: {exc}"
             ) from exc
+
+    @fastapi_app.get("/api/v1/cache-stats")
+    @fastapi_app.get("/api/cache-stats")
+    async def get_cache_stats(
+        response: Response,
+        authorization: str | None = Header(None),
+    ) -> dict[str, Any]:
+        """Return aggregate cache telemetry ratios, occupancy, and top cached patches."""
+        expected_token = os.environ.get("CACHE_STATS_TOKEN", "").strip()
+        if expected_token:
+            expected_header = f"Bearer {expected_token}"
+            if not authorization or not hmac.compare_digest(authorization, expected_header):
+                raise HTTPException(
+                    status_code=403, detail="Invalid or missing CACHE_STATS_TOKEN"
+                )
+        response.headers["Cache-Control"] = "no-store"
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            active_service._io_executor, active_service.cache.get_cache_stats
+        )
 
     @fastapi_app.post("/api/v1/admin/clear-cache")
     async def clear_cache(

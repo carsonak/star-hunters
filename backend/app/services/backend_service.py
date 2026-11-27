@@ -395,7 +395,6 @@ class StarHuntersBackendService:
         count = 0
         for slug, meta in SHOWCASE_TARGETS.items():
             grid_key, ra_q, dec_q = compute_grid_key(meta["ra"], meta["dec"], 5.0)
-            self.cache.pin_grid_key(grid_key)
             manifest = build_sky_patch_manifest_payload(
                 ra=meta["ra"],
                 dec=meta["dec"],
@@ -809,6 +808,8 @@ class StarHuntersBackendService:
         ra: float,
         dec: float,
         fov: float = 5.0,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
     ) -> dict[str, Any]:
         """Synchronously resolve, validate, and cache a sky-patch manifest and frames.
 
@@ -816,16 +817,20 @@ class StarHuntersBackendService:
             ra: Field center Right Ascension in degrees.
             dec: Field center Declination in degrees.
             fov: Field of view in arcminutes.
+            client_ip: Optional client IP address for anonymous visitor deduplication.
+            user_agent: Optional browser User-Agent string for visitor deduplication.
 
         Returns:
             Validated ``SkyPatchManifest`` dictionary.
         """
         grid_key, ra_q, dec_q = compute_grid_key(ra, dec, fov)
+        visitor_token = self.cache.compute_visitor_token(client_ip, user_agent)
         cached_manifest = self.cache.get_manifest(grid_key)
         if cached_manifest is not None:
             is_legacy_demo = self._is_pending_archival_demo(cached_manifest)
             if not (self.enable_archival_data and is_legacy_demo):
                 validate_sky_patch_manifest(cached_manifest)
+                self.cache.record_patch_hit(grid_key, visitor_token)
                 return cached_manifest
 
         stale_manifest = self.cache.get_manifest(grid_key, allow_stale=True)
@@ -835,8 +840,6 @@ class StarHuntersBackendService:
         manifest = build_sky_patch_manifest_payload(ra=ra, dec=dec, fov_arcmin=fov)
         manifest = self._apply_cached_pipeline_sync(manifest, ra=ra, dec=dec, fov=fov)
         slug = manifest["target_metadata"]["slug"]
-        if slug in SHOWCASE_TARGETS:
-            self.cache.pin_grid_key(grid_key)
         frames = generate_synthetic_epoch_frames(slug=slug, manifest=manifest)
 
         if self.enable_archival_data:
@@ -878,6 +881,7 @@ class StarHuntersBackendService:
             fov_arcmin=fov,
             manifest=manifest,
             frames=frames,
+            visitor_token=visitor_token,
         )
         return manifest
 
@@ -888,6 +892,7 @@ class StarHuntersBackendService:
         fov: float = 5.0,
         live_catalogs: bool = True,
         client_ip: str | None = None,
+        user_agent: str | None = None,
     ) -> dict[str, Any]:
         """Asynchronously resolve, validate, and cache a sky-patch manifest and frames.
 
@@ -896,7 +901,8 @@ class StarHuntersBackendService:
             dec: Field center Declination in degrees.
             fov: Field of view in arcminutes.
             live_catalogs: Whether live SIMBAD/Gaia queries are allowed on cache miss.
-            client_ip: Optional client IP address for cold-miss archival rate limiting.
+            client_ip: Optional client IP address for rate limiting & visitor deduplication.
+            user_agent: Optional browser User-Agent string for visitor deduplication.
 
         Returns:
             Validated ``SkyPatchManifest`` dictionary.
@@ -907,6 +913,7 @@ class StarHuntersBackendService:
         t0 = time.perf_counter()
         loop = asyncio.get_running_loop()
         grid_key, ra_q, dec_q = compute_grid_key(ra, dec, fov)
+        visitor_token = self.cache.compute_visitor_token(client_ip, user_agent)
         cached_manifest = self.cache.peek_manifest_memory(grid_key)
         if cached_manifest is None:
             cached_manifest = await loop.run_in_executor(
@@ -917,6 +924,12 @@ class StarHuntersBackendService:
             if not (self.enable_archival_data and is_legacy_demo):
                 _logger.info("Sky patch cache hit for %s", grid_key)
                 validate_sky_patch_manifest(cached_manifest)
+                await loop.run_in_executor(
+                    self._io_executor,
+                    self.cache.record_patch_hit,
+                    grid_key,
+                    visitor_token,
+                )
                 return cached_manifest
 
         stale_manifest: dict[str, Any] | None = None
@@ -982,6 +995,7 @@ class StarHuntersBackendService:
                 fov_arcmin=fov,
                 manifest=merged_manifest,
                 frames=frames,
+                visitor_token=visitor_token,
             )
             validate_sky_patch_manifest(merged_manifest)
             return merged_manifest
@@ -989,8 +1003,6 @@ class StarHuntersBackendService:
         async def _compute_patch() -> dict[str, Any]:
             base_manifest = build_sky_patch_manifest_payload(ra=ra, dec=dec, fov_arcmin=fov)
             slug = base_manifest["target_metadata"]["slug"]
-            if slug in SHOWCASE_TARGETS:
-                self.cache.pin_grid_key(grid_key)
 
             catalog_coro = self._run_singleflight(
                 f"catalog_pipeline:{grid_key}:live{int(live_catalogs)}",
@@ -1222,10 +1234,12 @@ class StarHuntersBackendService:
         Raises:
             KeyError: If ``filename`` does not exist in cache or synthetic fallback.
         """
-        if accept_gzip:
+        is_flags = filename.endswith("_flags.bin")
+        if accept_gzip and (precision == "float32" or is_flags):
             cached_gz = self.cache.get_frame_gzip(grid_key, filename, precision=precision)
             if cached_gz is not None:
                 gz_bytes, dtype_header = cached_gz
+                self.cache.record_frame_serve(dtype_header)
                 return gz_bytes, {
                     "Cache-Control": "public, max-age=31536000, immutable",
                     "X-Binary-Dtype": dtype_header,
@@ -1233,17 +1247,14 @@ class StarHuntersBackendService:
                     "Content-Encoding": "gzip",
                     "Vary": "Accept-Encoding",
                 }
-        elif precision == "float16" and not filename.endswith("_flags.bin"):
-            cached_gz = self.cache.get_frame_gzip(grid_key, filename, precision="float16")
-            if cached_gz is not None:
-                gz_bytes, dtype_header = cached_gz
-                return gzip.decompress(gz_bytes), {
-                    "Cache-Control": "public, max-age=31536000, immutable",
-                    "X-Binary-Dtype": dtype_header,
-                    "Content-Type": "application/octet-stream",
-                }
 
-        raw = self.cache.get_frame(grid_key, filename)
+        raw: bytes | None = None
+        if not is_flags:
+            cached_gz32 = self.cache.get_frame_gzip(grid_key, filename, precision="float32")
+            if cached_gz32 is not None:
+                raw = gzip.decompress(cached_gz32[0])
+        if raw is None:
+            raw = self.cache.get_frame(grid_key, filename)
         if raw is None:
             cached_manifest = self.cache.get_manifest(grid_key)
             if cached_manifest is not None:
@@ -1257,7 +1268,6 @@ class StarHuntersBackendService:
                 raise KeyError(f"Frame not found: {grid_key}/{filename}")
             raw = frames[filename]
 
-        is_flags = filename.endswith("_flags.bin")
         if is_flags:
             dtype_header = "uint8"
             body = raw
@@ -1268,13 +1278,15 @@ class StarHuntersBackendService:
             dtype_header = "float32"
             body = raw
 
+        self.cache.record_frame_serve(dtype_header)
         headers = {
             "Cache-Control": "public, max-age=31536000, immutable",
             "X-Binary-Dtype": dtype_header,
             "Content-Type": "application/octet-stream",
         }
         if accept_gzip:
-            body = gzip.compress(body, compresslevel=3)
+            compress_lvl = 1 if dtype_header == "float16" else 3
+            body = gzip.compress(body, compresslevel=compress_lvl)
             headers["Content-Encoding"] = "gzip"
             headers["Vary"] = "Accept-Encoding"
         return body, headers
@@ -1286,11 +1298,12 @@ class StarHuntersBackendService:
         precision: Literal["float32", "float16"] = "float32",
         accept_gzip: bool = False,
     ) -> tuple[bytes, dict[str, str]]:
-        """Serve RAM LRU frame hits synchronously and offload SQLite reads to ``_io_executor``."""
-        if accept_gzip:
+        """Serve RAM LRU frame hits synchronously and offload SQLite/conversion to ``_io_executor``."""
+        if accept_gzip and (precision == "float32" or filename.endswith("_flags.bin")):
             peeked = self.cache.peek_frame_gzip_memory(grid_key, filename, precision=precision)
             if peeked is not None:
                 gz_bytes, dtype_header = peeked
+                self.cache.record_frame_serve(dtype_header)
                 return gz_bytes, {
                     "Cache-Control": "public, max-age=31536000, immutable",
                     "X-Binary-Dtype": dtype_header,

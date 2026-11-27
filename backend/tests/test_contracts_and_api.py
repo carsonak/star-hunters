@@ -587,23 +587,24 @@ class TestPhase0ContractsAndBackend(unittest.TestCase):
         self.assertGreater(len(ceres_hits), 0)
         self.assertEqual(ceres_hits[0]["target_slug"], "ceres_asteroid")
 
-        # Pinned showcase patches survive LRU eviction before non-pinned custom patches
-        pin_db = str(Path(self.temp_dir.name) / "pin.db")
-        pin_cache = SpatialSqliteCache(db_path=pin_db, max_cache_bytes=20_000_000)
-        svc = StarHuntersBackendService(cache=pin_cache)
+        # Segmented SLRU eviction: 2-visitor shared patch survives eviction ahead of 1-visitor patch
+        slru_db = str(Path(self.temp_dir.name) / "slru.db")
+        slru_cache = SpatialSqliteCache(db_path=slru_db, max_cache_bytes=20_000_000)
+        svc = StarHuntersBackendService(cache=slru_cache)
 
-        # Fetch showcase patch (automatically pinned) and custom patch (unpinned)
-        m_showcase = svc.get_sky_patch(133.7951, -7.2451, 5.0)
-        m_custom = svc.get_sky_patch(15.0, 15.0, 5.0)
-        showcase_size = pin_cache.get_patch_byte_size(m_showcase["query"]["grid_key"])
-        custom_size = pin_cache.get_patch_byte_size(m_custom["query"]["grid_key"])
-        pin_cache.max_cache_bytes = int(showcase_size + custom_size * 1.15)
+        # User A creates patch 1, User B visits it (promoted to 2 distinct visitors), User A creates patch 2 (1 visitor)
+        m_shared = svc.get_sky_patch(133.7951, -7.2451, 5.0, client_ip="10.0.0.1", user_agent="UA-A")
+        svc.get_sky_patch(133.7951, -7.2451, 5.0, client_ip="10.0.0.2", user_agent="UA-B")
+        m_single = svc.get_sky_patch(15.0, 15.0, 5.0, client_ip="10.0.0.1", user_agent="UA-A")
+        shared_size = slru_cache.get_patch_byte_size(m_shared["query"]["grid_key"])
+        single_size = slru_cache.get_patch_byte_size(m_single["query"]["grid_key"])
+        slru_cache.max_cache_bytes = int(shared_size + single_size * 1.15)
 
-        # Inserting a third patch must evict the unpinned custom patch, preserving pinned showcase
-        m_custom2 = svc.get_sky_patch(45.0, 25.0, 5.0)
-        self.assertIsNotNone(pin_cache.get_manifest(m_showcase["query"]["grid_key"]))
-        self.assertIsNone(pin_cache.get_manifest(m_custom["query"]["grid_key"]))
-        self.assertIsNotNone(pin_cache.get_manifest(m_custom2["query"]["grid_key"]))
+        # Inserting a third patch must evict the 1-visitor patch, preserving the 2-visitor shared patch
+        m_single2 = svc.get_sky_patch(45.0, 25.0, 5.0, client_ip="10.0.0.3", user_agent="UA-C")
+        self.assertIsNotNone(slru_cache.get_manifest(m_shared["query"]["grid_key"]))
+        self.assertIsNone(slru_cache.get_manifest(m_single["query"]["grid_key"]))
+        self.assertIsNotNone(slru_cache.get_manifest(m_single2["query"]["grid_key"]))
 
     def test_fastapi_progressive_endpoints_gzip_binary_streaming_and_admin_clear(self) -> None:
         from fastapi.middleware.gzip import GZipMiddleware
