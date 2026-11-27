@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import gzip
+import hashlib
+import hmac
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -15,10 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-from app.models.contracts import (
-    BINARY_DETECTOR_FLOAT32_BYTES,
-    convert_float32_bytes_to_float16_bytes,
-)
+from app.models.contracts import BINARY_DETECTOR_FLOAT32_BYTES
 from app.utils.astronomy import (
     compute_ephemeris_fov_bounds,
     filter_ephemeris_candidates_in_fov,
@@ -31,9 +32,22 @@ DEFAULT_MAX_CACHE_BYTES = 750 * 1024 * 1024  # 750 MB
 DEFAULT_MAX_MEMORY_CACHE_BYTES = 128 * 1024 * 1024  # 128 MB
 DEFAULT_CATALOG_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 DEFAULT_SKY_PATCH_TTL_SECONDS = 7 * 24 * 3600  # 7 days (weekly SPHEREx IRSA releases)
+DEFAULT_POPULARITY_HALF_LIFE_SECONDS = 7 * 24 * 3600.0  # 7-day exponential decay half-life
+POPULARITY_EPOCH_T0 = 1700000000.0  # Fixed anchor epoch so rank comparisons cancel current time t
+MAX_RECENT_VISITOR_HASHES = 128  # 128 x 4-byte hashes = 512 bytes max per patch
 LAST_ACCESS_UPDATE_INTERVAL_SECONDS = 300.0  # 5 minutes
-SCHEMA_VERSION = 1
-_SCHEMA_PATH = Path(__file__).with_name("spatial_cache_schema.sql")
+SCHEMA_VERSION = 2
+_MIGRATIONS_DIR = Path(__file__).with_name("migrations")
+
+TELEMETRY_METRICS = (
+    "client_local_patch_hits",
+    "client_local_catalog_hits",
+    "common_multi_user_hits",
+    "same_user_backend_repeats",
+    "unique_cold_misses",
+    "float32_frame_serves",
+    "float16_frame_serves",
+)
 
 
 def _resolve_max_cache_bytes(max_cache_bytes: int | None) -> int:
@@ -73,6 +87,35 @@ def _resolve_patch_ttl_seconds(patch_ttl_seconds: float | None) -> float:
         return max(0.0, float(raw))
     except ValueError:
         return float(DEFAULT_SKY_PATCH_TTL_SECONDS)
+
+
+def _resolve_popularity_half_life_seconds(half_life_seconds: float | None) -> float:
+    """Resolve exponential popularity decay half-life from argument or env var."""
+    if half_life_seconds is not None:
+        return max(60.0, float(half_life_seconds))
+    raw = os.environ.get("POPULARITY_HALF_LIFE_SECONDS", "").strip()
+    if not raw:
+        return float(DEFAULT_POPULARITY_HALF_LIFE_SECONDS)
+    try:
+        return max(60.0, float(raw))
+    except ValueError:
+        return float(DEFAULT_POPULARITY_HALF_LIFE_SECONDS)
+
+
+def _visitor_in_ring(ring: bytes, token: bytes) -> bool:
+    """Return True if 4-byte ``token`` is present at any 4-byte aligned slot in ``ring``."""
+    if len(token) != 4 or not ring:
+        return False
+    return any(ring[i : i + 4] == token for i in range(0, len(ring) - (len(ring) % 4), 4))
+
+
+def _append_visitor_ring(ring: bytes, token: bytes) -> bytes:
+    """Append 4-byte ``token`` to ``ring``, keeping at most ``MAX_RECENT_VISITOR_HASHES`` slots."""
+    if len(token) != 4:
+        return ring
+    max_bytes = MAX_RECENT_VISITOR_HASHES * 4
+    updated = ring + token
+    return updated[-max_bytes:] if len(updated) > max_bytes else updated
 
 
 class _MemoryLruCache:
@@ -237,40 +280,49 @@ def compute_grid_key(
 
 
 class SpatialSqliteCache:
-    """Two-tier SQLite spatial cache with per-thread connection pooling and LRU pruning."""
+    """Two-tier SQLite spatial cache with per-thread connection pooling and SLRU pruning."""
 
     def __init__(
         self,
         db_path: str | None = None,
         max_cache_bytes: int | None = None,
-        pinned_grid_keys: set[str] | None = None,
         max_memory_bytes: int | None = None,
         last_access_update_interval: float = LAST_ACCESS_UPDATE_INTERVAL_SECONDS,
         patch_ttl_seconds: float | None = None,
+        popularity_half_life_seconds: float | None = None,
     ) -> None:
-        """Initialize the SQLite spatial cache and schema.
+        """Initialize the SQLite spatial cache and run pending SQL migrations.
 
         Args:
             db_path: Path to the SQLite database file. Defaults to
                 ``SQLITE_DB_PATH`` or ``/tmp/star_hunters_cache.db``.
             max_cache_bytes: Maximum combined byte budget for cached sky patches
-                and catalog regions before LRU eviction triggers.
-            pinned_grid_keys: Optional set of showcase ``grid_key`` values that
-                LRU eviction should preserve unless pinned entries alone exceed
-                ``max_cache_bytes``.
+                and catalog regions before SLRU eviction triggers.
             max_memory_bytes: Optional byte budget for the in-process LRU cache.
                 Defaults to ``IN_MEMORY_CACHE_MB`` env var or 128 MB (``0`` disables).
             last_access_update_interval: Minimum seconds between SQLite
                 ``last_accessed`` timestamp writes for the same row.
             patch_ttl_seconds: TTL in seconds for ``sky_patches`` and
                 ``spectra_cache`` entries before revalidation (default 7 days).
+            popularity_half_life_seconds: Exponential decay half-life for multi-user
+                patch popularity ranking (default 7 days).
         """
         self.db_path = db_path or os.environ.get("SQLITE_DB_PATH", "/tmp/star_hunters_cache.db")
         self.max_cache_bytes = _resolve_max_cache_bytes(max_cache_bytes)
-        self.pinned_grid_keys: set[str] = set(pinned_grid_keys or ())
         self.last_access_update_interval = max(0.0, float(last_access_update_interval))
         self.patch_ttl_seconds = _resolve_patch_ttl_seconds(patch_ttl_seconds)
+        self._half_life_seconds = _resolve_popularity_half_life_seconds(
+            popularity_half_life_seconds
+        )
+        self._decay_lambda = math.log(2.0) / self._half_life_seconds
         self._mem_cache = _MemoryLruCache(max_bytes=_resolve_max_memory_bytes(max_memory_bytes))
+        self._visitors_lock = threading.Lock()
+        self._mem_visitors: dict[str, bytes] = {}
+        self._hmac_lock = threading.Lock()
+        self._hmac_day = int(time.time() // 86400)
+        self._hmac_secret = os.urandom(32)
+        self._telemetry_lock = threading.Lock()
+        self._telemetry_deltas: dict[str, int] = {m: 0 for m in TELEMETRY_METRICS}
         self._local = threading.local()
         self._pool_lock = threading.Lock()
         self._connections: list[sqlite3.Connection] = []
@@ -298,7 +350,15 @@ class SpatialSqliteCache:
                 pass
 
     def close(self) -> None:
-        """Close all pooled SQLite connections across threads."""
+        """Flush pending telemetry counters and close all pooled SQLite connections."""
+        try:
+            with self._telemetry_lock:
+                has_pending = any(v > 0 for v in self._telemetry_deltas.values())
+            if has_pending:
+                with self.connection() as conn:
+                    self._flush_telemetry_locked(conn)
+        except sqlite3.Error:
+            pass
         with self._pool_lock:
             self._local = threading.local()
             conns = list(self._connections)
@@ -308,14 +368,6 @@ class SpatialSqliteCache:
                 conn.close()
             except sqlite3.Error:
                 pass
-
-    def pin_grid_key(self, grid_key: str) -> None:
-        """Pin a showcase ``grid_key`` so LRU eviction prefers evicting non-pinned patches.
-
-        Args:
-            grid_key: Quantized spatial grid identifier to pin.
-        """
-        self.pinned_grid_keys.add(grid_key)
 
     def _get_thread_connection(self) -> sqlite3.Connection:
         """Return or open the current thread's pooled SQLite connection."""
@@ -351,18 +403,96 @@ class SpatialSqliteCache:
             yield conn
 
     def _init_db(self) -> None:
-        """Enable persistent WAL mode, apply schema DDL, and stamp ``user_version``."""
-        schema_sql = _SCHEMA_PATH.read_text(encoding="utf-8")
+        """Enable persistent WAL mode and apply pending numbered SQL migrations."""
+        migration_files = sorted(
+            _MIGRATIONS_DIR.glob("*.sql"),
+            key=lambda p: int(p.stem.split("_", 1)[0]),
+        )
         with self.connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
             current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            conn.executescript(schema_sql)
-            if current_version < SCHEMA_VERSION:
-                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            if current_version >= SCHEMA_VERSION:
+                return
+            for sql_path in migration_files:
+                version_num = int(sql_path.stem.split("_", 1)[0])
+                if version_num <= current_version:
+                    continue
+                conn.executescript(sql_path.read_text(encoding="utf-8"))
+                conn.execute(f"PRAGMA user_version = {version_num}")
 
     def _invalidate_grid_key_memory(self, grid_key: str) -> None:
         """Remove all in-process LRU cache entries associated with ``grid_key`` in O(1)."""
         self._mem_cache.delete_tag(grid_key)
+        with self._visitors_lock:
+            self._mem_visitors.pop(grid_key, None)
+
+    def compute_visitor_token(
+        self, client_ip: str | None, user_agent: str | None = None
+    ) -> bytes | None:
+        """Compute an anonymous 4-byte daily HMAC visitor token purely in RAM.
+
+        Rotates the 32-byte random secret every UTC day without touching disk or
+        setting browser cookies/localStorage IDs.
+        """
+        ip_norm = (client_ip or "").strip()
+        ua_norm = (user_agent or "").strip()
+        if not ip_norm and not ua_norm:
+            return None
+        today = int(time.time() // 86400)
+        with self._hmac_lock:
+            if today != self._hmac_day:
+                self._hmac_day = today
+                self._hmac_secret = os.urandom(32)
+            secret = self._hmac_secret
+        msg = f"{ip_norm or 'unknown'}|{ua_norm}".encode("utf-8", errors="replace")
+        return hmac.new(secret, msg, hashlib.sha256).digest()[:4]
+
+    def _incr_telemetry(self, metric: str, amount: int = 1) -> None:
+        if amount <= 0 or metric not in self._telemetry_deltas:
+            return
+        with self._telemetry_lock:
+            self._telemetry_deltas[metric] += int(amount)
+
+    def record_client_cache_delta(self, header_value: str | None) -> None:
+        """Parse ``X-Cache-Delta: p=<int>,c=<int>`` into aggregate telemetry deltas."""
+        if not header_value:
+            return
+        for part in header_value.split(","):
+            key, sep, val = part.strip().partition("=")
+            if not sep:
+                continue
+            try:
+                count = max(0, min(1000, int(val.strip())))
+            except ValueError:
+                continue
+            if key.strip() == "p" and count > 0:
+                self._incr_telemetry("client_local_patch_hits", count)
+            elif key.strip() == "c" and count > 0:
+                self._incr_telemetry("client_local_catalog_hits", count)
+
+    def record_frame_serve(self, dtype_header: str) -> None:
+        """Record whether a served detector frame used ``float32`` or ``float16``."""
+        if dtype_header == "float32":
+            self._incr_telemetry("float32_frame_serves", 1)
+        elif dtype_header == "float16":
+            self._incr_telemetry("float16_frame_serves", 1)
+
+    def _flush_telemetry_locked(self, conn: sqlite3.Connection) -> None:
+        """Upsert accumulated in-memory telemetry deltas into SQLite on an active write."""
+        with self._telemetry_lock:
+            pending = [(k, v) for k, v in self._telemetry_deltas.items() if v > 0]
+            if not pending:
+                return
+            for k, _ in pending:
+                self._telemetry_deltas[k] = 0
+        conn.executemany(
+            """
+            INSERT INTO cache_telemetry_counters (metric, value)
+            VALUES (?, ?)
+            ON CONFLICT(metric) DO UPDATE SET value = value + excluded.value
+            """,
+            pending,
+        )
 
     def _is_entry_expired(self, created_at: float, now: float) -> bool:
         """Return True when a cached row has exceeded ``self.patch_ttl_seconds``."""
@@ -484,7 +614,9 @@ class SpatialSqliteCache:
         precision: Literal["float32", "float16"] = "float32",
     ) -> tuple[bytes, str] | None:
         """Fetch a pre-gzipped binary frame solely from the in-process RAM LRU cache."""
-        dtype_header = "uint8" if filename.endswith("_flags.bin") else precision
+        if precision == "float16" and not filename.endswith("_flags.bin"):
+            return None
+        dtype_header = "uint8" if filename.endswith("_flags.bin") else "float32"
         cached_gz = self._mem_cache.get(f"frame_gz:{grid_key}:{filename}:{dtype_header}")
         if cached_gz is None:
             return None
@@ -617,16 +749,22 @@ class SpatialSqliteCache:
     ) -> tuple[bytes, str] | None:
         """Fetch a wire-ready gzipped binary frame from RAM or SQLite with zero recompression.
 
+        Only canonical ``gzip_float32`` detector cubes and ``gzip_uint8`` flag masks
+        are persisted; ``float16`` requests return ``None`` here so the service layer
+        converts on-the-fly from ``float32`` without duplicating RAM/disk cache entries.
+
         Args:
             grid_key: Quantized spatial grid identifier.
             filename: Frame filename (e.g. ``"pass_1.bin"``).
             precision: Target floating-point precision for detector cubes.
 
         Returns:
-            Tuple of ``(gzip_bytes, dtype_header)``, or ``None`` if missing.
+            Tuple of ``(gzip_bytes, dtype_header)``, or ``None`` if missing or ``float16``.
         """
-        dtype_header = "uint8" if filename.endswith("_flags.bin") else precision
-        target_encoding = "gzip_uint8" if dtype_header == "uint8" else f"gzip_{dtype_header}"
+        if precision == "float16" and not filename.endswith("_flags.bin"):
+            return None
+        dtype_header = "uint8" if filename.endswith("_flags.bin") else "float32"
+        target_encoding = "gzip_uint8" if dtype_header == "uint8" else "gzip_float32"
         gz_key = f"frame_gz:{grid_key}:{filename}:{dtype_header}"
         cached_gz = self._mem_cache.get(gz_key)
         if cached_gz is not None:
@@ -639,6 +777,96 @@ class SpatialSqliteCache:
         self._mem_cache.put(gz_key, blob)
         return blob, dtype_header
 
+    def record_patch_hit(
+        self, grid_key: str, visitor_token: bytes | None = None
+    ) -> bool:
+        """Record a sky-patch cache hit, deduplicating repeat visitors and updating popularity.
+
+        Returns ``True`` when a new distinct visitor was recorded, or ``False`` for
+        same-visitor repeats (or when ``visitor_token`` is absent).
+        """
+        if not visitor_token or len(visitor_token) != 4:
+            self._incr_telemetry("same_user_backend_repeats", 1)
+            return False
+
+        with self._visitors_lock:
+            cached_ring = self._mem_visitors.get(grid_key)
+        if cached_ring is not None and _visitor_in_ring(cached_ring, visitor_token):
+            self._incr_telemetry("same_user_backend_repeats", 1)
+            return False
+
+        now = time.time()
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT distinct_visitors, popularity_score, last_popularity_ts,
+                       recent_visitors, last_accessed
+                FROM sky_patches
+                WHERE grid_key = ?
+                """,
+                (grid_key,),
+            ).fetchone()
+            if not row:
+                return False
+
+            ring = bytes(row["recent_visitors"] or b"")
+            if _visitor_in_ring(ring, visitor_token):
+                with self._visitors_lock:
+                    self._mem_visitors[grid_key] = ring
+                self._incr_telemetry("same_user_backend_repeats", 1)
+                if now - float(row["last_accessed"]) >= self.last_access_update_interval:
+                    conn.execute(
+                        "UPDATE sky_patches SET last_accessed = ? WHERE grid_key = ?",
+                        (now, grid_key),
+                    )
+                    self._flush_telemetry_locked(conn)
+                return False
+
+            # distinct_visitors serves two roles:
+            # 1) Eviction tier gate: patches with distinct_visitors < 2 stay in the
+            #    probationary Pass 1 tier so single-user exploration never evicts
+            #    shared patches (distinct_visitors >= 2).
+            # 2) Deduplication gate: popularity_score only increments when a visitor's
+            #    4-byte token is absent from the 128-slot recent_visitors ring buffer.
+            #
+            # Epoch-anchored log-decay algebra (eliminates background cleanup timers):
+            # - At any future time t, a patch's decayed score is:
+            #       S(t) = S_last * exp(-lambda * (t - t_last))
+            # - Comparing two patches A and B at time t:
+            #       S_A(t) < S_B(t)
+            #   <=> ln(S_A) - lambda * (t - t_A) < ln(S_B) - lambda * (t - t_B)
+            # - Adding lambda * (t - t0) to both sides cancels current time t completely:
+            #       ln(S_A) + lambda * (t_A - t0) < ln(S_B) + lambda * (t_B - t0)
+            # - Storing popularity_rank = ln(S) + lambda * (t_last - t0) therefore lets
+            #   SQLite rank decayed popularity using a static B-tree index without ever
+            #   waking up to decay stale rows.
+            last_pop_ts = float(row["last_popularity_ts"] or row["last_accessed"] or now)
+            dt = max(0.0, now - last_pop_ts)
+            old_score = max(1e-9, float(row["popularity_score"] or 1.0))
+            new_score = old_score * math.exp(-self._decay_lambda * dt) + 1.0
+            new_rank = math.log(new_score) + self._decay_lambda * (now - POPULARITY_EPOCH_T0)
+            new_ring = _append_visitor_ring(ring, visitor_token)
+            new_distinct = int(row["distinct_visitors"] or 1) + 1
+
+            conn.execute(
+                """
+                UPDATE sky_patches
+                SET distinct_visitors = ?,
+                    popularity_score = ?,
+                    last_popularity_ts = ?,
+                    popularity_rank = ?,
+                    recent_visitors = ?,
+                    last_accessed = ?
+                WHERE grid_key = ?
+                """,
+                (new_distinct, new_score, now, new_rank, new_ring, now, grid_key),
+            )
+            self._incr_telemetry("common_multi_user_hits", 1)
+            self._flush_telemetry_locked(conn)
+            with self._visitors_lock:
+                self._mem_visitors[grid_key] = new_ring
+            return True
+
     def put_sky_patch(
         self,
         grid_key: str,
@@ -647,20 +875,13 @@ class SpatialSqliteCache:
         fov_arcmin: float,
         manifest: dict[str, Any],
         frames: dict[str, bytes],
+        visitor_token: bytes | None = None,
     ) -> None:
-        """Persist a sky-patch manifest, catalog overlays, and dual-precision frames.
+        """Persist a sky-patch manifest, catalog overlays, and ``float32``/``uint8`` frames.
 
-        Stores both ``gzip_float32`` and ``gzip_float16`` rows for detector cubes
-        (and ``gzip_uint8`` for flag masks) so subsequent cache hits serve either
-        precision with zero runtime compression or conversion.
-
-        Args:
-            grid_key: Quantized spatial grid identifier.
-            ra_center: Quantized Right Ascension center in degrees.
-            dec_center: Quantized Declination center in degrees.
-            fov_arcmin: Field of view in arcminutes.
-            manifest: Validated sky-patch manifest dictionary.
-            frames: Mapping of frame filename to raw little-endian bytes.
+        Stores only ``gzip_float32`` detector cubes (and ``gzip_uint8`` flag masks)
+        to maximize SQLite capacity, populates ``_mem_cache`` immediately for follow-up
+        ``/frames`` requests, and initializes SLRU popularity metadata.
         """
         now = time.time()
         slim_manifest = {key: value for key, value in manifest.items() if key != "catalog_overlays"}
@@ -673,23 +894,30 @@ class SpatialSqliteCache:
         catalogs_str = json.dumps(catalogs_payload, separators=(",", ":"))
 
         frame_rows: list[tuple[str, str, bytes, int, str]] = []
+        mem_frame_entries: list[tuple[str, bytes]] = []
         total_bytes = len(manifest_str.encode("utf-8")) + len(catalogs_str.encode("utf-8"))
         for fname, raw_bytes in frames.items():
-            if not fname.endswith("_flags.bin") and len(raw_bytes) == BINARY_DETECTOR_FLOAT32_BYTES:
-                gz32 = gzip.compress(raw_bytes, compresslevel=3)
-                f16_bytes = convert_float32_bytes_to_float16_bytes(raw_bytes)
-                gz16 = gzip.compress(f16_bytes, compresslevel=3)
-                frame_rows.append((grid_key, fname, gz32, len(raw_bytes), "gzip_float32"))
-                frame_rows.append((grid_key, fname, gz16, len(f16_bytes), "gzip_float16"))
-                total_bytes += len(gz32) + len(gz16)
-            elif fname.endswith("_flags.bin"):
+            if fname.endswith("_flags.bin"):
                 comp = gzip.compress(raw_bytes, compresslevel=3)
                 frame_rows.append((grid_key, fname, comp, len(raw_bytes), "gzip_uint8"))
+                mem_frame_entries.append((f"frame_gz:{grid_key}:{fname}:uint8", comp))
                 total_bytes += len(comp)
+            elif len(raw_bytes) == BINARY_DETECTOR_FLOAT32_BYTES:
+                gz32 = gzip.compress(raw_bytes, compresslevel=3)
+                frame_rows.append((grid_key, fname, gz32, len(raw_bytes), "gzip_float32"))
+                mem_frame_entries.append((f"frame_gz:{grid_key}:{fname}:float32", gz32))
+                total_bytes += len(gz32)
             else:
                 comp = gzip.compress(raw_bytes, compresslevel=3)
                 frame_rows.append((grid_key, fname, comp, len(raw_bytes), "gzip_float32"))
+                mem_frame_entries.append((f"frame_gz:{grid_key}:{fname}:float32", comp))
                 total_bytes += len(comp)
+
+        initial_visitors = (
+            visitor_token if (visitor_token and len(visitor_token) == 4) else b""
+        )
+        # Initial popularity_rank = ln(1.0) + lambda * (now - t0) = lambda * (now - t0)
+        initial_rank = self._decay_lambda * (now - POPULARITY_EPOCH_T0)
 
         with self.connection() as conn:
             conn.execute(
@@ -700,8 +928,10 @@ class SpatialSqliteCache:
                 """
                 INSERT INTO sky_patches (
                     grid_key, ra_center, dec_center, fov_arcmin,
-                    manifest_json, catalogs_json, byte_size, created_at, last_accessed
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    manifest_json, catalogs_json, byte_size, created_at, last_accessed,
+                    distinct_visitors, popularity_score, last_popularity_ts,
+                    popularity_rank, recent_visitors
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     grid_key,
@@ -713,6 +943,11 @@ class SpatialSqliteCache:
                     total_bytes,
                     now,
                     now,
+                    1,
+                    1.0,
+                    now,
+                    initial_rank,
+                    initial_visitors,
                 ),
             )
             if frame_rows:
@@ -726,7 +961,28 @@ class SpatialSqliteCache:
                     frame_rows,
                 )
             self._prune_if_needed(conn, preserve_grid_key=grid_key)
+            self._incr_telemetry("unique_cold_misses", 1)
+            self._flush_telemetry_locked(conn)
+
         self._invalidate_grid_key_memory(grid_key)
+        # Populate _mem_cache immediately so follow-up /frames requests skip SQLite
+        cached_manifest = copy.copy(manifest)
+        cached_manifest["query"] = {**manifest["query"], "cached": True}
+        self._mem_cache.put(
+            f"manifest:{grid_key}", self._encode_ttl_mem_entry(now, cached_manifest)
+        )
+        cached_catalogs = {
+            "query": {**manifest["query"], "cached": True},
+            "wcs": manifest["wcs"],
+            "catalog_overlays": manifest["catalog_overlays"],
+        }
+        self._mem_cache.put(
+            f"catalogs:{grid_key}", self._encode_ttl_mem_entry(now, cached_catalogs)
+        )
+        for mem_key, blob in mem_frame_entries:
+            self._mem_cache.put(mem_key, blob)
+        with self._visitors_lock:
+            self._mem_visitors[grid_key] = initial_visitors
 
     def get_patch_byte_size(self, grid_key: str) -> int:
         """Return the stored compressed byte size of a cached sky patch.
@@ -1212,39 +1468,40 @@ class SpatialSqliteCache:
         if total_bytes <= self.max_cache_bytes:
             return evicted
 
+        # Segmented SLRU eviction using the idx_sky_patches_eviction B-tree index:
+        # - Pass 1 (distinct_visitors < 2 -> key 0): Single-user exploration patches
+        #   are evicted first in pure LRU order (last_accessed ASC).
+        # - Pass 2 (distinct_visitors >= 2 -> key 1): Shared multi-user patches are
+        #   evicted by popularity_rank ASC, which equals ln(S(t)) + lambda*(t - t0)
+        #   shifted by a global constant, so older unvisited popular patches decay
+        #   below active ones without any background cleanup job.
         cursor = conn.execute(
-            "SELECT grid_key, byte_size FROM sky_patches ORDER BY last_accessed ASC, rowid ASC"
+            """
+            SELECT grid_key, byte_size
+            FROM sky_patches
+            ORDER BY (CASE WHEN distinct_visitors >= 2 THEN 1 ELSE 0 END) ASC,
+                     (CASE WHEN distinct_visitors >= 2 THEN popularity_rank ELSE last_accessed END) ASC,
+                     last_accessed ASC,
+                     rowid ASC
+            """
         )
         rows = cursor.fetchall()
-        # Pass 1: Evict non-pinned sky patches first so known showcase targets stay cached
         for r in rows:
             if total_bytes <= self.max_cache_bytes:
                 break
             if preserve_grid_key and r["grid_key"] == preserve_grid_key:
                 continue
-            if r["grid_key"] in self.pinned_grid_keys:
-                continue
             conn.execute("DELETE FROM sky_patches WHERE grid_key = ?", (r["grid_key"],))
             self._invalidate_grid_key_memory(str(r["grid_key"]))
             total_bytes -= int(r["byte_size"])
             evicted += 1
-        # Pass 2: Only if pinned patches alone exceed max_cache_bytes, evict oldest pinned patches
-        if total_bytes > self.max_cache_bytes:
-            for r in rows:
-                if total_bytes <= self.max_cache_bytes:
-                    break
-                if preserve_grid_key and r["grid_key"] == preserve_grid_key:
-                    continue
-                if r["grid_key"] not in self.pinned_grid_keys:
-                    continue
-                conn.execute("DELETE FROM sky_patches WHERE grid_key = ?", (r["grid_key"],))
-                self._invalidate_grid_key_memory(str(r["grid_key"]))
-                total_bytes -= int(r["byte_size"])
-                evicted += 1
         return evicted
 
     def clear(self) -> None:
-        """Delete all cached entries across every SQLite cache table."""
+        """Delete all cached entries and telemetry counters across every SQLite table."""
+        with self._telemetry_lock:
+            for metric in self._telemetry_deltas:
+                self._telemetry_deltas[metric] = 0
         with self.connection() as conn:
             conn.execute("DELETE FROM binary_frames")
             conn.execute("DELETE FROM sky_patches")
@@ -1252,4 +1509,92 @@ class SpatialSqliteCache:
             conn.execute("DELETE FROM capital_zenith_cache")
             conn.execute("DELETE FROM catalog_region_cache")
             conn.execute("DELETE FROM solar_system_ephemeris")
+            conn.execute("DELETE FROM cache_telemetry_counters")
         self._mem_cache.clear()
+        with self._visitors_lock:
+            self._mem_visitors.clear()
+
+    def get_cache_stats(self, top_n: int = 10) -> dict[str, Any]:
+        """Return aggregate cache telemetry ratios, storage occupancy, and top patches."""
+        now = time.time()
+        with self.connection() as conn:
+            self._flush_telemetry_locked(conn)
+            counter_rows = conn.execute(
+                "SELECT metric, value FROM cache_telemetry_counters"
+            ).fetchall()
+            patch_agg = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt,
+                       COALESCE(SUM(CASE WHEN distinct_visitors >= 2 THEN 1 ELSE 0 END), 0) AS multi_cnt,
+                       COALESCE(SUM(byte_size), 0) AS total_bytes
+                FROM sky_patches
+                """
+            ).fetchone()
+            cat_agg = conn.execute(
+                "SELECT COALESCE(SUM(byte_size), 0) AS total_bytes FROM catalog_region_cache"
+            ).fetchone()
+            top_rows = conn.execute(
+                """
+                SELECT grid_key, distinct_visitors, popularity_score, last_popularity_ts,
+                       byte_size, last_accessed
+                FROM sky_patches
+                ORDER BY (CASE WHEN distinct_visitors >= 2 THEN 1 ELSE 0 END) DESC,
+                         (CASE WHEN distinct_visitors >= 2 THEN popularity_rank ELSE last_accessed END) DESC,
+                         last_accessed DESC
+                LIMIT ?
+                """,
+                (max(1, int(top_n)),),
+            ).fetchall()
+
+        counters = {m: 0 for m in TELEMETRY_METRICS}
+        for row in counter_rows:
+            name = str(row["metric"])
+            if name in counters:
+                counters[name] = int(row["value"])
+
+        local_patch = counters["client_local_patch_hits"]
+        common_hits = counters["common_multi_user_hits"]
+        repeat_backend = counters["same_user_backend_repeats"]
+        cold_misses = counters["unique_cold_misses"]
+        total_patch_events = local_patch + common_hits + repeat_backend + cold_misses
+
+        def _pct(num: int, den: int) -> float:
+            return round((num / den) * 100.0, 2) if den > 0 else 0.0
+
+        top_patches = []
+        for r in top_rows:
+            dt = max(0.0, now - float(r["last_popularity_ts"] or r["last_accessed"] or now))
+            decayed = float(r["popularity_score"] or 1.0) * math.exp(-self._decay_lambda * dt)
+            top_patches.append(
+                {
+                    "grid_key": str(r["grid_key"]),
+                    "distinct_visitors": int(r["distinct_visitors"] or 1),
+                    "decayed_popularity": round(decayed, 4),
+                    "byte_size": int(r["byte_size"] or 0),
+                }
+            )
+
+        patch_count = int(patch_agg["cnt"]) if patch_agg else 0
+        multi_count = int(patch_agg["multi_cnt"]) if patch_agg else 0
+        return {
+            "telemetry": {
+                **counters,
+                "total_patch_events": total_patch_events,
+                "common_multi_user_pct": _pct(common_hits, total_patch_events),
+                "same_user_local_pct": _pct(local_patch, total_patch_events),
+                "same_user_backend_pct": _pct(repeat_backend, total_patch_events),
+                "unique_cold_miss_pct": _pct(cold_misses, total_patch_events),
+                "client_absorption_pct": _pct(local_patch, local_patch + repeat_backend),
+            },
+            "storage": {
+                "ram_used_bytes": self._mem_cache.current_bytes,
+                "ram_max_bytes": self._mem_cache.max_bytes,
+                "sqlite_patch_count": patch_count,
+                "sqlite_multi_user_patches": multi_count,
+                "sqlite_single_user_patches": max(0, patch_count - multi_count),
+                "sqlite_patch_bytes": int(patch_agg["total_bytes"]) if patch_agg else 0,
+                "sqlite_catalog_bytes": int(cat_agg["total_bytes"]) if cat_agg else 0,
+                "sqlite_max_bytes": self.max_cache_bytes,
+            },
+            "top_patches": top_patches,
+        }

@@ -103,6 +103,7 @@ async function fetchWithTimeout(
   signal: AbortSignal | undefined,
   timeoutMs: number,
   label: string,
+  headers?: Record<string, string>,
 ): Promise<Response> {
   if (signal?.aborted) {
     const abortErr = new Error('Aborted');
@@ -119,7 +120,10 @@ async function fetchWithTimeout(
   }, timeoutMs);
 
   try {
-    const res = await fetchImpl(input, { signal: controller.signal });
+    const init: RequestInit = headers
+      ? { signal: controller.signal, headers }
+      : { signal: controller.signal };
+    const res = await fetchImpl(input, init);
     if (signal?.aborted) {
       const abortErr = new Error('Aborted');
       abortErr.name = 'AbortError';
@@ -572,12 +576,15 @@ export async function loadLiveCoordinatesFlow(
     })
     .catch(() => null);
 
+  const deltaHeader = cache.consumeTelemetryDeltaHeader?.() ?? null;
+  const patchHeaders = deltaHeader ? { 'X-Cache-Delta': deltaHeader } : undefined;
   const patchRes = await fetchWithTimeout(
     fetchImpl,
     `/api/v1/sky-patch?${qs}`,
     signal,
     patchTimeoutMs,
     'Sky patch request',
+    patchHeaders,
   );
   if (signal?.aborted) return { aborted: true };
   if (!patchRes.ok) {

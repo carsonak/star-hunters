@@ -394,6 +394,8 @@ export class TieredLruStore<T extends LruTimestampedEntry> {
 export class ClientPatchCache {
   private readonly maxEntries: number;
   private accessClock = 0;
+  private reportedPatchHits = 0;
+  private reportedCatalogHits = 0;
   private dbPromise: Promise<IDBDatabase | null> | null = null;
   private readonly patchStore: TieredLruStore<CachedSkyPatchBundle>;
   private readonly catalogStore: TieredLruStore<CatalogCacheEntry>;
@@ -641,6 +643,22 @@ export class ClientPatchCache {
       catalogHits: this.catalogStore.hitCount,
       catalogMisses: this.catalogStore.missCount,
     };
+  }
+
+  /**
+   * Consume unsent local cache hit deltas for piggybacked `X-Cache-Delta` telemetry.
+   *
+   * Returns `null` when both deltas are zero so cold requests emit no extra headers.
+   */
+  public consumeTelemetryDeltaHeader(): string | null {
+    const pDelta = Math.max(0, this.patchStore.hitCount - this.reportedPatchHits);
+    const cDelta = Math.max(0, this.catalogStore.hitCount - this.reportedCatalogHits);
+    this.reportedPatchHits = this.patchStore.hitCount;
+    this.reportedCatalogHits = this.catalogStore.hitCount;
+    if (pDelta === 0 && cDelta === 0) {
+      return null;
+    }
+    return `p=${pDelta},c=${cDelta}`;
   }
 
   /**

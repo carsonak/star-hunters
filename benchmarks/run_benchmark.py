@@ -402,6 +402,11 @@ async def run_phase(
             async with concurrency_sem:
                 user_t0 = time.perf_counter()
                 user_rng = random.Random(seed * 1000 + user_idx)
+                user_headers = {
+                    "X-Forwarded-For": f"10.{(user_idx // 256) % 256}.{user_idx % 256}.1",
+                    "User-Agent": f"StarHuntersBench/{user_idx}",
+                }
+                user_precision = "float16" if (user_idx % 4 == 0) else "float32"
                 persona = _pick_persona(user_rng, smoke_test=smoke_test)
                 persona_counts[persona["name"]] += 1
                 target_stay_s = float(persona["target_stay_s"])
@@ -480,6 +485,8 @@ async def run_phase(
                             frame_endpoint="frame:cold",
                             spectrum_endpoint="spectrum:cold",
                             fetch_spectrum=(user_rng.random() < persona["spectra_prob"]),
+                            precision=user_precision,
+                            user_headers=user_headers,
                             track_cached=True,
                         )
                     await _pace_until(3)
@@ -499,6 +506,8 @@ async def run_phase(
                             frame_endpoint="frame:hot",
                             spectrum_endpoint="spectrum:hot",
                             fetch_spectrum=want_spec,
+                            precision=user_precision,
+                            user_headers=user_headers,
                             track_cached=True,
                         )
                     await _pace_until(4)
@@ -516,6 +525,8 @@ async def run_phase(
                             frame_endpoint="frame:hot",
                             spectrum_endpoint="spectrum:hot",
                             fetch_spectrum=want_spec,
+                            precision=user_precision,
+                            user_headers=user_headers,
                             track_cached=True,
                         )
                     await _pace_until(5)
@@ -550,6 +561,8 @@ async def run_phase(
                             frame_endpoint="frame:city_zenith",
                             spectrum_endpoint="spectrum:city_zenith",
                             fetch_spectrum=(user_rng.random() < persona["spectra_prob"]),
+                            precision=user_precision,
+                            user_headers=user_headers,
                             track_cached=True,
                         )
                     await _pace_until(6)

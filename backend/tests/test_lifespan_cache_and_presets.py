@@ -592,11 +592,11 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
             self.assertLessEqual(mem_cache._mem_cache.current_bytes, 2 * 1024 * 1024)
             self.assertIsNone(mem_cache._mem_cache.get(f"frame_raw:{grid_key}:pass_1.bin"))
 
-            # put_sky_patch invalidates manifest & frames in memory
+            # put_sky_patch invalidates stale frame_raw and populates manifest in memory
             self.assertIsNotNone(mem_cache.get_manifest(grid_key))
             self.assertIsNotNone(mem_cache._mem_cache.get(f"manifest:{grid_key}"))
             mem_cache.put_sky_patch(grid_key, ra_q, dec_q, 5.0, manifest, frames)
-            self.assertIsNone(mem_cache._mem_cache.get(f"manifest:{grid_key}"))
+            self.assertIsNotNone(mem_cache._mem_cache.get(f"manifest:{grid_key}"))
             self.assertIsNone(mem_cache._mem_cache.get(f"frame_raw:{grid_key}:pass_2.bin"))
 
             # clear() wipes memory cache too
@@ -633,9 +633,9 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
         grid_key = manifest["query"]["grid_key"]
         client = TestClient(create_app(service))
 
-        # Float16 gzip payload is precomputed at put_sky_patch time -> 0 conversions on read
+        # Float16 is converted on-the-fly from cached float32 without polluting RAM LRU with float16
         with patch(
-            "app.services.spatial_cache.convert_float32_bytes_to_float16_bytes",
+            "app.services.backend_service.convert_float32_bytes_to_float16_bytes",
             wraps=convert_float32_bytes_to_float16_bytes,
         ) as mock_f16:
             r1 = client.get(
@@ -654,7 +654,7 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
                 params={"precision": "float16"},
                 headers={"Accept-Encoding": "gzip"},
             )
-            self.assertEqual(mock_f16.call_count, 0)
+            self.assertEqual(mock_f16.call_count, 3)
 
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r2.status_code, 200)
@@ -667,8 +667,9 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
         self.assertEqual(len(r1.content), BINARY_DETECTOR_FLOAT16_BYTES)
         self.assertEqual(r1.content, r2.content)
         self.assertEqual(r1.content, r3.content)
-        # get_frame_gzip must cache only frame_gz without polluting _mem_cache with frame_raw
-        self.assertIsNotNone(self.cache._mem_cache.get(f"frame_gz:{grid_key}:pass_1.bin:float16"))
+        # _mem_cache holds canonical float32 only—never float16 or uncompressed frame_raw
+        self.assertIsNotNone(self.cache._mem_cache.get(f"frame_gz:{grid_key}:pass_1.bin:float32"))
+        self.assertIsNone(self.cache._mem_cache.get(f"frame_gz:{grid_key}:pass_1.bin:float16"))
         self.assertIsNone(self.cache._mem_cache.get(f"frame_raw:{grid_key}:pass_1.bin"))
 
         identity_resp = client.get(
@@ -773,7 +774,7 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
         encodings_by_name: dict[str, set[str]] = {}
         for r in rows:
             encodings_by_name.setdefault(str(r["filename"]), set()).add(str(r["encoding"]))
-        self.assertEqual(encodings_by_name["pass_1.bin"], {"gzip_float32", "gzip_float16"})
+        self.assertEqual(encodings_by_name["pass_1.bin"], {"gzip_float32"})
         self.assertEqual(encodings_by_name["pass_1_flags.bin"], {"gzip_uint8"})
 
         raw32 = self.cache.get_frame(grid_key, "pass_1.bin")
@@ -784,20 +785,15 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
         self.assertEqual(flags_raw, frames["pass_1_flags.bin"])
 
         self.cache._mem_cache.clear()
-        with (
-            patch("app.services.spatial_cache.gzip.compress") as mock_gz,
-            patch("app.services.spatial_cache.convert_float32_bytes_to_float16_bytes") as mock_f16,
-        ):
+        with patch("app.services.spatial_cache.gzip.compress") as mock_gz:
             gz32 = self.cache.get_frame_gzip(grid_key, "pass_1.bin", precision="float32")
             gz16 = self.cache.get_frame_gzip(grid_key, "pass_1.bin", precision="float16")
             self.assertEqual(mock_gz.call_count, 0)
-            self.assertEqual(mock_f16.call_count, 0)
 
-        assert gz32 is not None and gz16 is not None
+        assert gz32 is not None
+        self.assertIsNone(gz16)
         self.assertEqual(gz32[1], "float32")
         self.assertEqual(gzip.decompress(gz32[0]), frames["pass_1.bin"])
-        self.assertEqual(gz16[1], "float16")
-        self.assertEqual(len(gzip.decompress(gz16[0])), BINARY_DETECTOR_FLOAT16_BYTES)
 
     def test_sky_patch_and_spectrum_7day_ttl_and_stale_if_error(self) -> None:
         from app.services.spatial_cache import SpatialSqliteCache
@@ -1010,7 +1006,7 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
                 for r in conn.execute("PRAGMA index_list(catalog_region_cache)").fetchall()
             }
         self.assertIn("encoding", cols)
-        self.assertIn("idx_sky_patches_last_accessed", patch_idx)
+        self.assertIn("idx_sky_patches_eviction", patch_idx)
         self.assertIn("idx_catalog_region_last_accessed", cat_idx)
 
     def test_memory_lru_o1_tag_invalidation(self) -> None:
@@ -1069,6 +1065,175 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
         res1[0]["label"] = "MUTATED"
         res3 = search_known_objects("saturn", limit=10)
         self.assertEqual(res3[0]["label"], orig_label)
+
+    def test_migration_001_to_002_drops_float16_and_backfills_popularity(self) -> None:
+        import sqlite3
+        from pathlib import Path
+        from app.services.spatial_cache import SCHEMA_VERSION, SpatialSqliteCache
+
+        mig_db = self.tmp_path / "v1_upgrade.db"
+        sql_001 = (
+            Path(__file__).resolve().parent.parent
+            / "app"
+            / "services"
+            / "migrations"
+            / "001_initial_schema.sql"
+        ).read_text(encoding="utf-8")
+        conn = sqlite3.connect(str(mig_db))
+        conn.executescript(sql_001)
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute(
+            """
+            INSERT INTO sky_patches (
+                grid_key, ra_center, dec_center, fov_arcmin,
+                manifest_json, catalogs_json, byte_size, created_at, last_accessed
+            ) VALUES ('ra10.00_dec20.00_fov5.0', 10.0, 20.0, 5.0, '{}', '{}', 500, 1750000000.0, 1750000000.0)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO binary_frames (grid_key, filename, encoding, compressed_blob, raw_byte_size)
+            VALUES ('ra10.00_dec20.00_fov5.0', 'pass_1.bin', 'gzip_float32', X'010203', 100),
+                   ('ra10.00_dec20.00_fov5.0', 'pass_1.bin', 'gzip_float16', X'0405', 50)
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        upgraded = SpatialSqliteCache(db_path=str(mig_db))
+        try:
+            with upgraded.connection() as c2:
+                ver = int(c2.execute("PRAGMA user_version").fetchone()[0])
+                self.assertEqual(ver, SCHEMA_VERSION)
+                encs = [
+                    str(r["encoding"])
+                    for r in c2.execute("SELECT encoding FROM binary_frames").fetchall()
+                ]
+                self.assertEqual(encs, ["gzip_float32"])
+                row = c2.execute(
+                    "SELECT byte_size, distinct_visitors, popularity_score, last_popularity_ts "
+                    "FROM sky_patches WHERE grid_key = 'ra10.00_dec20.00_fov5.0'"
+                ).fetchone()
+                self.assertEqual(int(row["byte_size"]), 7)  # "{}" (2) + "{}" (2) + X'010203' (3)
+                self.assertEqual(int(row["distinct_visitors"]), 1)
+                self.assertEqual(float(row["popularity_score"]), 1.0)
+                self.assertEqual(float(row["last_popularity_ts"]), 1750000000.0)
+        finally:
+            upgraded.close()
+
+    def test_slru_visitor_dedup_and_5_month_decay_eviction(self) -> None:
+        import math
+        from app.services.spatial_cache import POPULARITY_EPOCH_T0, SpatialSqliteCache
+
+        slru_cache = SpatialSqliteCache(
+            db_path=str(self.tmp_path / "decay_slru.db"),
+            max_cache_bytes=50_000_000,
+        )
+        try:
+            meta = SHOWCASE_TARGETS["wise_0855"]
+            manifest = build_sky_patch_manifest_payload(
+                ra=meta["ra"], dec=meta["dec"], fov_arcmin=5.0, slug="wise_0855"
+            )
+            frames = generate_synthetic_epoch_frames(slug="wise_0855", manifest=manifest)
+            gk_old_hot, ra1, dec1 = compute_grid_key(10.0, 10.0, 5.0)
+            gk_new_hot, ra2, dec2 = compute_grid_key(20.0, 20.0, 5.0)
+
+            tok_a = slru_cache.compute_visitor_token("10.0.0.1", "BrowserA")
+            tok_b = slru_cache.compute_visitor_token("10.0.0.2", "BrowserB")
+            assert tok_a is not None and tok_b is not None
+
+            slru_cache.put_sky_patch(gk_old_hot, ra1, dec1, 5.0, manifest, frames, visitor_token=tok_a)
+            # Same visitor hitting 10 times does NOT increment distinct_visitors
+            for _ in range(10):
+                self.assertFalse(slru_cache.record_patch_hit(gk_old_hot, tok_a))
+            # Different visitor promotes distinct_visitors to 2
+            self.assertTrue(slru_cache.record_patch_hit(gk_old_hot, tok_b))
+
+            # Simulate gk_old_hot having 50 hits 150 days (~5 months) ago
+            now = time.time()
+            old_ts = now - (150 * 86400.0)
+            old_rank = math.log(50.0) + slru_cache._decay_lambda * (old_ts - POPULARITY_EPOCH_T0)
+            with slru_cache.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE sky_patches
+                    SET distinct_visitors = 50,
+                        popularity_score = 50.0,
+                        last_popularity_ts = ?,
+                        popularity_rank = ?,
+                        last_accessed = ?
+                    WHERE grid_key = ?
+                    """,
+                    (old_ts, old_rank, old_ts, gk_old_hot),
+                )
+
+            # Insert gk_new_hot with 2 visitors today
+            slru_cache.put_sky_patch(gk_new_hot, ra2, dec2, 5.0, manifest, frames, visitor_token=tok_a)
+            self.assertTrue(slru_cache.record_patch_hit(gk_new_hot, tok_b))
+
+            # Cap cache to hold ~2.15 patches and insert a 3rd patch -> must evict gk_old_hot, keeping gk_new_hot + gk_third
+            size_new = slru_cache.get_patch_byte_size(gk_new_hot)
+            slru_cache.max_cache_bytes = int(size_new * 2.15)
+            gk_third, ra3, dec3 = compute_grid_key(30.0, 30.0, 5.0)
+            slru_cache.put_sky_patch(gk_third, ra3, dec3, 5.0, manifest, frames, visitor_token=tok_a)
+
+            self.assertIsNone(slru_cache.get_manifest(gk_old_hot))
+            self.assertIsNotNone(slru_cache.get_manifest(gk_new_hot))
+            self.assertIsNotNone(slru_cache.get_manifest(gk_third))
+        finally:
+            slru_cache.close()
+
+    def test_cache_stats_endpoint_telemetry_and_token_gate(self) -> None:
+        service = StarHuntersBackendService(cache=self.cache, enable_archival_data=False)
+        client = TestClient(create_app(service))
+
+        # Cold miss + piggybacked client delta
+        r1 = client.get(
+            "/api/v1/sky-patch",
+            params={"ra": 12.0, "dec": 14.0, "fov": 5.0, "live_catalogs": False},
+            headers={"X-Forwarded-For": "10.1.1.1", "User-Agent": "UA-1", "X-Cache-Delta": "p=3,c=2"},
+        )
+        self.assertEqual(r1.status_code, 200)
+        # Same browser repeat
+        r2 = client.get(
+            "/api/v1/sky-patch",
+            params={"ra": 12.0, "dec": 14.0, "fov": 5.0, "live_catalogs": False},
+            headers={"X-Forwarded-For": "10.1.1.1", "User-Agent": "UA-1"},
+        )
+        self.assertEqual(r2.status_code, 200)
+        # Second browser -> common_multi_user_hits
+        r3 = client.get(
+            "/api/v1/sky-patch",
+            params={"ra": 12.0, "dec": 14.0, "fov": 5.0, "live_catalogs": False},
+            headers={"X-Forwarded-For": "10.1.1.2", "User-Agent": "UA-2"},
+        )
+        self.assertEqual(r3.status_code, 200)
+        # Newer single-visitor patch must sort BELOW the 2-visitor patch in top_patches
+        r4 = client.get(
+            "/api/v1/sky-patch",
+            params={"ra": 40.0, "dec": 40.0, "fov": 5.0, "live_catalogs": False},
+            headers={"X-Forwarded-For": "10.1.1.3", "User-Agent": "UA-3"},
+        )
+        self.assertEqual(r4.status_code, 200)
+
+        stats_resp = client.get("/api/v1/cache-stats")
+        self.assertEqual(stats_resp.status_code, 200)
+        body = stats_resp.json()
+        tel = body["telemetry"]
+        self.assertEqual(tel["client_local_patch_hits"], 3)
+        self.assertEqual(tel["client_local_catalog_hits"], 2)
+        self.assertEqual(tel["unique_cold_misses"], 2)
+        self.assertEqual(tel["same_user_backend_repeats"], 1)
+        self.assertEqual(tel["common_multi_user_hits"], 1)
+        self.assertEqual(body["top_patches"][0]["distinct_visitors"], 2)
+
+        with patch.dict("os.environ", {"CACHE_STATS_TOKEN": "secret-bench-token"}):
+            self.assertEqual(client.get("/api/v1/cache-stats").status_code, 403)
+            ok = client.get(
+                "/api/v1/cache-stats",
+                headers={"Authorization": "Bearer secret-bench-token"},
+            )
+            self.assertEqual(ok.status_code, 200)
 
 
 if __name__ == "__main__":

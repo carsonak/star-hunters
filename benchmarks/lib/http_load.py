@@ -79,6 +79,7 @@ async def fetch_patch_and_frames(
     spectrum_label: str | None = None,
     precision: str = "float16",
     frame_headers: dict[str, str] | None = None,
+    user_headers: dict[str, str] | None = None,
     track_cached: bool = False,
 ) -> int:
     """Fetch Stage A catalogs, Stage B sky-patch manifest, binary frames, and optional spectrum."""
@@ -88,6 +89,7 @@ async def fetch_patch_and_frames(
         {"ra": ra, "dec": dec, "fov": 5.0, "live_catalogs": "false"},
         records,
         catalogs_endpoint,
+        headers=user_headers,
     )
     patch_resp = await timed_get(
         client,
@@ -95,6 +97,7 @@ async def fetch_patch_and_frames(
         {"ra": ra, "dec": dec, "fov": 5.0, "live_catalogs": "false"},
         records,
         sky_patch_endpoint,
+        headers=user_headers,
         track_cached=track_cached,
     )
     requests_made = 2

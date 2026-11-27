@@ -123,47 +123,51 @@ def instrument_cache(
     orig_peek_frame_gzip = cache.peek_frame_gzip_memory
 
     @functools.wraps(orig_get_manifest)
-    def wrap_get_manifest(grid_key: str) -> dict[str, Any] | None:
+    def wrap_get_manifest(grid_key: str, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         in_ram = _in_mem_peek(f"manifest:{grid_key}")
-        res = orig_get_manifest(grid_key)
+        res = orig_get_manifest(grid_key, *args, **kwargs)
         _record_tier("manifest", in_ram, res is not None)
         return res
 
     @functools.wraps(orig_get_catalogs)
-    def wrap_get_catalogs(grid_key: str) -> dict[str, Any] | None:
+    def wrap_get_catalogs(grid_key: str, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         in_ram = _in_mem_peek(f"catalogs:{grid_key}")
-        res = orig_get_catalogs(grid_key)
+        res = orig_get_catalogs(grid_key, *args, **kwargs)
         _record_tier("catalogs", in_ram, res is not None)
         return res
 
     @functools.wraps(orig_get_frame_gzip)
-    def wrap_get_frame_gzip(grid_key: str, filename: str, precision: str = "float32") -> Any:
-        dtype_hdr = "uint8" if filename.endswith("_flags.bin") else precision
+    def wrap_get_frame_gzip(
+        grid_key: str, filename: str, precision: str = "float32", *args: Any, **kwargs: Any
+    ) -> Any:
+        if precision == "float16" and not filename.endswith("_flags.bin"):
+            return orig_get_frame_gzip(grid_key, filename, precision=precision, *args, **kwargs)
+        dtype_hdr = "uint8" if filename.endswith("_flags.bin") else "float32"
         in_ram = _in_mem_peek(f"frame_gz:{grid_key}:{filename}:{dtype_hdr}") or _in_mem_peek(
             f"frame_raw:{grid_key}:{filename}"
         )
-        res = orig_get_frame_gzip(grid_key, filename, precision=precision)
+        res = orig_get_frame_gzip(grid_key, filename, precision=precision, *args, **kwargs)
         _record_tier("frame_gzip", in_ram, res is not None)
         return res
 
     @functools.wraps(orig_get_frame)
-    def wrap_get_frame(grid_key: str, filename: str) -> bytes | None:
+    def wrap_get_frame(grid_key: str, filename: str, *args: Any, **kwargs: Any) -> bytes | None:
         in_ram = _in_mem_peek(f"frame_raw:{grid_key}:{filename}")
-        res = orig_get_frame(grid_key, filename)
+        res = orig_get_frame(grid_key, filename, *args, **kwargs)
         _record_tier("frame_raw", in_ram, res is not None)
         return res
 
     @functools.wraps(orig_get_spectrum)
-    def wrap_get_spectrum(spectrum_key: str) -> dict[str, Any] | None:
+    def wrap_get_spectrum(spectrum_key: str, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         in_ram = _in_mem_peek(f"spectrum:{spectrum_key}")
-        res = orig_get_spectrum(spectrum_key)
+        res = orig_get_spectrum(spectrum_key, *args, **kwargs)
         _record_tier("spectrum", in_ram, res is not None)
         return res
 
     @functools.wraps(orig_get_zenith)
-    def wrap_get_zenith(cache_key: str) -> dict[str, Any] | None:
+    def wrap_get_zenith(cache_key: str, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         in_ram = _in_mem_peek(f"zenith:{cache_key}")
-        res = orig_get_zenith(cache_key)
+        res = orig_get_zenith(cache_key, *args, **kwargs)
         _record_tier("zenith", in_ram, res is not None)
         return res
 
@@ -186,29 +190,31 @@ def instrument_cache(
             stats["cold_writes"]["zenith"] += 1
 
     @functools.wraps(orig_peek_manifest)
-    def wrap_peek_manifest(grid_key: str) -> dict[str, Any] | None:
-        res = orig_peek_manifest(grid_key)
+    def wrap_peek_manifest(grid_key: str, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        res = orig_peek_manifest(grid_key, *args, **kwargs)
         if res is not None:
             _record_tier("manifest", True, True)
         return res
 
     @functools.wraps(orig_peek_catalogs)
-    def wrap_peek_catalogs(grid_key: str) -> dict[str, Any] | None:
-        res = orig_peek_catalogs(grid_key)
+    def wrap_peek_catalogs(grid_key: str, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        res = orig_peek_catalogs(grid_key, *args, **kwargs)
         if res is not None:
             _record_tier("catalogs", True, True)
         return res
 
     @functools.wraps(orig_peek_spectrum)
-    def wrap_peek_spectrum(spectrum_key: str) -> dict[str, Any] | None:
-        res = orig_peek_spectrum(spectrum_key)
+    def wrap_peek_spectrum(spectrum_key: str, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        res = orig_peek_spectrum(spectrum_key, *args, **kwargs)
         if res is not None:
             _record_tier("spectrum", True, True)
         return res
 
     @functools.wraps(orig_peek_frame_gzip)
-    def wrap_peek_frame_gzip(grid_key: str, filename: str, precision: str = "float32") -> Any:
-        res = orig_peek_frame_gzip(grid_key, filename, precision=precision)
+    def wrap_peek_frame_gzip(
+        grid_key: str, filename: str, precision: str = "float32", *args: Any, **kwargs: Any
+    ) -> Any:
+        res = orig_peek_frame_gzip(grid_key, filename, precision=precision, *args, **kwargs)
         if res is not None:
             _record_tier("frame_gzip", True, True)
         return res

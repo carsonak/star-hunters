@@ -767,3 +767,58 @@ test('Live coordinate loading skips /api/v1/spectrum prefetch, surfaces FastAPI 
     /timed out/i,
   );
 });
+
+test('ClientPatchCache piggybacks X-Cache-Delta once on subsequent /api/v1/sky-patch request', async () => {
+  const cache = new ClientPatchCache(4);
+  const presetManifest = readPresetManifest('wise_0855');
+
+  // Seed one cached catalog so we can trigger a local cache hit
+  await cache.putCatalogs('ra10.00_dec20.00_fov5.0', {
+    query: { ra: 10, dec: 20, fov_arcmin: 5, grid_key: 'ra10.00_dec20.00_fov5.0', cached: false },
+    wcs: presetManifest.wcs,
+    catalog_overlays: presetManifest.catalog_overlays,
+  });
+  await cache.getCatalogs('ra10.00_dec20.00_fov5.0');
+
+  const seenPatchHeaders = [];
+  const mockFetch = async (url, init) => {
+    if (url.startsWith('/api/v1/sky-patch')) {
+      seenPatchHeaders.push(init?.headers ?? null);
+      return new Response(JSON.stringify(presetManifest), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url.startsWith('/api/v1/catalogs')) {
+      return new Response(
+        JSON.stringify({
+          query: presetManifest.query,
+          wcs: presetManifest.wcs,
+          catalog_overlays: presetManifest.catalog_overlays,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    if (url.includes('_flags.bin')) {
+      return new Response(new Uint8Array(65536), { status: 200 });
+    }
+    return new Response(new Uint8Array(1572864), {
+      status: 200,
+      headers: { 'X-Binary-Dtype': 'float32' },
+    });
+  };
+
+  await loadLiveCoordinatesFlow(50, 10, 5.0, {
+    cache,
+    fetchImpl: mockFetch,
+    onReady: () => {},
+  });
+  await loadLiveCoordinatesFlow(60, 15, 5.0, {
+    cache,
+    fetchImpl: mockFetch,
+    onReady: () => {},
+  });
+
+  assert.deepEqual(seenPatchHeaders[0], { 'X-Cache-Delta': 'p=0,c=1' });
+  assert.equal(seenPatchHeaders[1], null);
+});
