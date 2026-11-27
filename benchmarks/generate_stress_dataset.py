@@ -28,7 +28,7 @@ import numpy as np
 from lib.paths import DATA_DIR, ensure_runtime_dirs, resolve_backend_dir
 
 DEFAULT_OUT_DIR = DATA_DIR / "stress_dataset"
-DEFAULT_MB_PER_PATCH = 1.23
+DEFAULT_MB_PER_PATCH = 2.66
 
 SEARCH_TERMS = [
     "mars", "saturn", "jupiter", "uranus", "neptune", "ceres", "vesta", "pallas",

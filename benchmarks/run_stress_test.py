@@ -58,6 +58,7 @@ def _parse_tier_spec(
     in_memory_mb: int,
     sqlite_max_mb: int,
     max_patches: int,
+    mb_per_patch: float = 2.66,
 ) -> dict[str, Any]:
     token = raw_tier.strip().lower()
     if token.startswith("ram_"):
@@ -71,7 +72,7 @@ def _parse_tier_spec(
         pct = int(token.rstrip("%"))
         token = f"db_{pct}"
     base_mb = in_memory_mb if scope == "ram" else sqlite_max_mb
-    pool_size = max(10, min(max_patches, int(round((base_mb * (pct / 100.0)) / 1.23))))
+    pool_size = max(10, min(max_patches, int(round((base_mb * (pct / 100.0)) / max(0.1, mb_per_patch)))))
     return {
         "label": token,
         "scope": scope,
@@ -288,8 +289,13 @@ async def _execute_user_journey(
     frontier_deck: list[dict[str, Any]],
     action_buckets: dict[str, list[dict[str, Any]]],
     records: list[dict[str, Any]],
+    user_id: int = 0,
 ) -> int:
     """Execute curated actions (zero timer sleeps) matching the chosen archetype."""
+    user_headers = {
+        "X-Forwarded-For": f"10.{(user_id // 256) % 256}.{user_id % 256}.1",
+        "User-Agent": f"StarHuntersBench/{user_id}",
+    }
     target_actions = user_rng.randint(archetype["min_actions"], archetype["max_actions"])
     name = archetype["name"]
     actions_done = 0
@@ -364,6 +370,7 @@ async def _execute_user_journey(
             spectrum_label=patch["label"],
             precision=precision,
             frame_headers=frame_headers,
+            user_headers=user_headers,
         )
 
         for _ in range(user_rng.randint(1, 3)):
@@ -411,13 +418,17 @@ async def _prewarm_patch_pool(
                         "fov": 5.0,
                         "live_catalogs": "false",
                     },
+                    headers={
+                        "X-Forwarded-For": "10.250.0.1",
+                        "User-Agent": "StarHuntersPrewarm/1",
+                    },
                 )
                 if pr.status_code == 200:
                     manifest = pr.json()
                     urls: list[tuple[str, dict[str, Any]]] = []
                     for ep in manifest.get("epochs", []):
                         if ep.get("detectors_data_url"):
-                            urls.append((ep["detectors_data_url"], {"precision": "float16"}))
+                            urls.append((ep["detectors_data_url"], {"precision": "float32"}))
                         if ep.get("flags_mask_url"):
                             urls.append((ep["flags_mask_url"], {}))
                     if urls:
@@ -497,6 +508,7 @@ async def run_stage(
                     frontier_deck,
                     action_buckets,
                     records,
+                    user_id=uid,
                 )
                 flow_latencies_ms[arch["name"]].append((time.perf_counter() - ut0) * 1000.0)
                 flow_counts[arch["name"]] += 1
@@ -734,6 +746,12 @@ def main() -> int:
     parser.add_argument("--in-memory-mb", type=int, default=192)
     parser.add_argument("--sqlite-max-mb", type=int, default=512)
     parser.add_argument(
+        "--mb-per-patch",
+        type=float,
+        default=2.66,
+        help="Estimated SQLite MB per cached sky patch for tier pool sizing (default: 2.66)",
+    )
+    parser.add_argument(
         "--ram-ratio",
         type=float,
         default=0.0,
@@ -850,7 +868,10 @@ def main() -> int:
         users_per_tier = args.users_per_stage if args.users_per_stage > 0 else args.users_per_tier
 
     tier_specs = [
-        _parse_tier_spec(t, in_memory_mb, sqlite_max_mb, len(patches)) for t in raw_tiers
+        _parse_tier_spec(
+            t, in_memory_mb, sqlite_max_mb, len(patches), mb_per_patch=args.mb_per_patch
+        )
+        for t in raw_tiers
     ]
     tiers = [ts["label"] for ts in tier_specs]
     reset_between_stages = not args.no_reset_between_stages
