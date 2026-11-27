@@ -1069,6 +1069,7 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
     def test_migration_001_to_002_drops_float16_and_backfills_popularity(self) -> None:
         import sqlite3
         from pathlib import Path
+
         from app.services.spatial_cache import SCHEMA_VERSION, SpatialSqliteCache
 
         mig_db = self.tmp_path / "v1_upgrade.db"
@@ -1087,7 +1088,10 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
             INSERT INTO sky_patches (
                 grid_key, ra_center, dec_center, fov_arcmin,
                 manifest_json, catalogs_json, byte_size, created_at, last_accessed
-            ) VALUES ('ra10.00_dec20.00_fov5.0', 10.0, 20.0, 5.0, '{}', '{}', 500, 1750000000.0, 1750000000.0)
+            ) VALUES (
+                'ra10.00_dec20.00_fov5.0', 10.0, 20.0, 5.0,
+                '{}', '{}', 500, 1750000000.0, 1750000000.0
+            )
             """
         )
         conn.execute(
@@ -1123,6 +1127,7 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
 
     def test_slru_visitor_dedup_and_5_month_decay_eviction(self) -> None:
         import math
+
         from app.services.spatial_cache import POPULARITY_EPOCH_T0, SpatialSqliteCache
 
         slru_cache = SpatialSqliteCache(
@@ -1142,7 +1147,9 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
             tok_b = slru_cache.compute_visitor_token("10.0.0.2", "BrowserB")
             assert tok_a is not None and tok_b is not None
 
-            slru_cache.put_sky_patch(gk_old_hot, ra1, dec1, 5.0, manifest, frames, visitor_token=tok_a)
+            slru_cache.put_sky_patch(
+                gk_old_hot, ra1, dec1, 5.0, manifest, frames, visitor_token=tok_a
+            )
             # Same visitor hitting 10 times does NOT increment distinct_visitors
             for _ in range(10):
                 self.assertFalse(slru_cache.record_patch_hit(gk_old_hot, tok_a))
@@ -1168,14 +1175,18 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
                 )
 
             # Insert gk_new_hot with 2 visitors today
-            slru_cache.put_sky_patch(gk_new_hot, ra2, dec2, 5.0, manifest, frames, visitor_token=tok_a)
+            slru_cache.put_sky_patch(
+                gk_new_hot, ra2, dec2, 5.0, manifest, frames, visitor_token=tok_a
+            )
             self.assertTrue(slru_cache.record_patch_hit(gk_new_hot, tok_b))
 
-            # Cap cache to hold ~2.15 patches and insert a 3rd patch -> must evict gk_old_hot, keeping gk_new_hot + gk_third
+            # Cap cache to hold ~2.15 patches and insert a 3rd patch -> must evict gk_old_hot
             size_new = slru_cache.get_patch_byte_size(gk_new_hot)
             slru_cache.max_cache_bytes = int(size_new * 2.15)
             gk_third, ra3, dec3 = compute_grid_key(30.0, 30.0, 5.0)
-            slru_cache.put_sky_patch(gk_third, ra3, dec3, 5.0, manifest, frames, visitor_token=tok_a)
+            slru_cache.put_sky_patch(
+                gk_third, ra3, dec3, 5.0, manifest, frames, visitor_token=tok_a
+            )
 
             self.assertIsNone(slru_cache.get_manifest(gk_old_hot))
             self.assertIsNotNone(slru_cache.get_manifest(gk_new_hot))
@@ -1191,7 +1202,11 @@ class LifespanCacheAndPresetsTests(unittest.TestCase):
         r1 = client.get(
             "/api/v1/sky-patch",
             params={"ra": 12.0, "dec": 14.0, "fov": 5.0, "live_catalogs": False},
-            headers={"X-Forwarded-For": "10.1.1.1", "User-Agent": "UA-1", "X-Cache-Delta": "p=3,c=2"},
+            headers={
+                "X-Forwarded-For": "10.1.1.1",
+                "User-Agent": "UA-1",
+                "X-Cache-Delta": "p=3,c=2",
+            },
         )
         self.assertEqual(r1.status_code, 200)
         # Same browser repeat

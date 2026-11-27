@@ -1298,7 +1298,7 @@ class StarHuntersBackendService:
         precision: Literal["float32", "float16"] = "float32",
         accept_gzip: bool = False,
     ) -> tuple[bytes, dict[str, str]]:
-        """Serve RAM LRU frame hits synchronously and offload SQLite/conversion to ``_io_executor``."""
+        """Serve RAM LRU frame hits synchronously; offload SQLite/conversion to ``_io_executor``."""
         if accept_gzip and (precision == "float32" or filename.endswith("_flags.bin")):
             peeked = self.cache.peek_frame_gzip_memory(grid_key, filename, precision=precision)
             if peeked is not None:

@@ -401,9 +401,7 @@ def create_app(service: StarHuntersBackendService | None = None) -> FastAPI:
         if expected_token:
             expected_header = f"Bearer {expected_token}"
             if not authorization or not hmac.compare_digest(authorization, expected_header):
-                raise HTTPException(
-                    status_code=403, detail="Invalid or missing CACHE_STATS_TOKEN"
-                )
+                raise HTTPException(status_code=403, detail="Invalid or missing CACHE_STATS_TOKEN")
         response.headers["Cache-Control"] = "no-store"
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(

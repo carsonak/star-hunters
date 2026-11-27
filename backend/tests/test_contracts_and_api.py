@@ -592,15 +592,18 @@ class TestPhase0ContractsAndBackend(unittest.TestCase):
         slru_cache = SpatialSqliteCache(db_path=slru_db, max_cache_bytes=20_000_000)
         svc = StarHuntersBackendService(cache=slru_cache)
 
-        # User A creates patch 1, User B visits it (promoted to 2 distinct visitors), User A creates patch 2 (1 visitor)
-        m_shared = svc.get_sky_patch(133.7951, -7.2451, 5.0, client_ip="10.0.0.1", user_agent="UA-A")
+        # User A creates patch 1, User B visits it (2 distinct visitors),
+        # and User A creates patch 2 (1 visitor).
+        m_shared = svc.get_sky_patch(
+            133.7951, -7.2451, 5.0, client_ip="10.0.0.1", user_agent="UA-A"
+        )
         svc.get_sky_patch(133.7951, -7.2451, 5.0, client_ip="10.0.0.2", user_agent="UA-B")
         m_single = svc.get_sky_patch(15.0, 15.0, 5.0, client_ip="10.0.0.1", user_agent="UA-A")
         shared_size = slru_cache.get_patch_byte_size(m_shared["query"]["grid_key"])
         single_size = slru_cache.get_patch_byte_size(m_single["query"]["grid_key"])
         slru_cache.max_cache_bytes = int(shared_size + single_size * 1.15)
 
-        # Inserting a third patch must evict the 1-visitor patch, preserving the 2-visitor shared patch
+        # Inserting a third patch must evict the 1-visitor patch, preserving the 2-visitor patch
         m_single2 = svc.get_sky_patch(45.0, 25.0, 5.0, client_ip="10.0.0.3", user_agent="UA-C")
         self.assertIsNotNone(slru_cache.get_manifest(m_shared["query"]["grid_key"]))
         self.assertIsNone(slru_cache.get_manifest(m_single["query"]["grid_key"]))

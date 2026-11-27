@@ -777,9 +777,7 @@ class SpatialSqliteCache:
         self._mem_cache.put(gz_key, blob)
         return blob, dtype_header
 
-    def record_patch_hit(
-        self, grid_key: str, visitor_token: bytes | None = None
-    ) -> bool:
+    def record_patch_hit(self, grid_key: str, visitor_token: bytes | None = None) -> bool:
         """Record a sky-patch cache hit, deduplicating repeat visitors and updating popularity.
 
         Returns ``True`` when a new distinct visitor was recorded, or ``False`` for
@@ -913,9 +911,7 @@ class SpatialSqliteCache:
                 mem_frame_entries.append((f"frame_gz:{grid_key}:{fname}:float32", comp))
                 total_bytes += len(comp)
 
-        initial_visitors = (
-            visitor_token if (visitor_token and len(visitor_token) == 4) else b""
-        )
+        initial_visitors = visitor_token if (visitor_token and len(visitor_token) == 4) else b""
         # Initial popularity_rank = ln(1.0) + lambda * (now - t0) = lambda * (now - t0)
         initial_rank = self._decay_lambda * (now - POPULARITY_EPOCH_T0)
 
@@ -1480,7 +1476,8 @@ class SpatialSqliteCache:
             SELECT grid_key, byte_size
             FROM sky_patches
             ORDER BY (CASE WHEN distinct_visitors >= 2 THEN 1 ELSE 0 END) ASC,
-                     (CASE WHEN distinct_visitors >= 2 THEN popularity_rank ELSE last_accessed END) ASC,
+                     (CASE WHEN distinct_visitors >= 2
+                           THEN popularity_rank ELSE last_accessed END) ASC,
                      last_accessed ASC,
                      rowid ASC
             """
@@ -1525,7 +1522,9 @@ class SpatialSqliteCache:
             patch_agg = conn.execute(
                 """
                 SELECT COUNT(*) AS cnt,
-                       COALESCE(SUM(CASE WHEN distinct_visitors >= 2 THEN 1 ELSE 0 END), 0) AS multi_cnt,
+                       COALESCE(
+                           SUM(CASE WHEN distinct_visitors >= 2 THEN 1 ELSE 0 END), 0
+                       ) AS multi_cnt,
                        COALESCE(SUM(byte_size), 0) AS total_bytes
                 FROM sky_patches
                 """
@@ -1539,7 +1538,8 @@ class SpatialSqliteCache:
                        byte_size, last_accessed
                 FROM sky_patches
                 ORDER BY (CASE WHEN distinct_visitors >= 2 THEN 1 ELSE 0 END) DESC,
-                         (CASE WHEN distinct_visitors >= 2 THEN popularity_rank ELSE last_accessed END) DESC,
+                         (CASE WHEN distinct_visitors >= 2
+                               THEN popularity_rank ELSE last_accessed END) DESC,
                          last_accessed DESC
                 LIMIT ?
                 """,
